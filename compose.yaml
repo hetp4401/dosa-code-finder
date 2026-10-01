@@ -1,4 +1,4 @@
-# Runs the published image. The build workflow fills in __TAG__ (the commit) and sends this to the fleet's control plane.
+# Runs the published image. The tag is the commit; the build workflow fills it in and sends this to the fleet's control plane.
 x-runner:
   port: 3000
 services:
