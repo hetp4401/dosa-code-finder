@@ -1,0 +1,17 @@
+[package]
+name = "dosa-code-finder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+futures = "0.3"
+tower-http = { version = "0.6", features = ["cors"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+

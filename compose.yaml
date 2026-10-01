@@ -1,0 +1,8 @@
+# Runs the published image. The build workflow fills in __TAG__ (the commit) and sends this to the fleet's control plane.
+x-runner:
+  port: 3000
+services:
+  app:
+    image: ghcr.io/hetp4401/dosa-code-finder:__TAG__
+    ports: ["3000:3000"]
+    restart: unless-stopped
