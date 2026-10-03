@@ -37,11 +37,11 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Deploy to the fleet
         env:
-          RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          FLEET_PASSWORD: ${{ secrets.FLEET_PASSWORD }}
           URL: https://control.billybishop4-workers.xyz/api/projects/dosa-code-finder
         run: |
           # Keep the replica count the fleet already has.
-          replicas=$(curl -fsS "$URL" -H "Authorization: Bearer $RUNNER_TOKEN" | jq '.replicas' || echo 1)
+          replicas=$(curl -fsS "$URL" -H "x-fleet-password: $FLEET_PASSWORD" | jq '.replicas' || echo 1)
           sed "s/__TAG__/$GITHUB_SHA/" compose.yaml | jq -Rs --argjson r "$replicas" '{compose: ., port: 3000, replicas: $r}' \
-            | curl -fsS -X PUT "$URL" -H "Authorization: Bearer $RUNNER_TOKEN" -H 'Content-Type: application/json' --data-binary @- \
+            | curl -fsS -X PUT "$URL" -H "x-fleet-password: $FLEET_PASSWORD" -H 'Content-Type: application/json' --data-binary @- \
             | jq '{name, version, replicas}'
