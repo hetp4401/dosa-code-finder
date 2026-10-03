@@ -33,8 +33,9 @@ const TARGET_URL: &str = "https://checktodine.com/customer_waitlist.php?business
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
 /// Kept low on purpose: the site answers 409 Conflict / drops connections
-/// when it sees a burst of concurrent requests from one IP.
-const MAX_CONCURRENT: usize = 5;
+/// when it sees a burst of concurrent requests from one IP. Raise
+/// cautiously; 100 was briefly OK from a quiet IP but 50 got throttled hard.
+const MAX_CONCURRENT: usize = 100;
 const INVALID_MARKER: &str = "Restaurant Code is not valid.";
 /// Exclusive upper bound for `to`: 100000 means "up to and including 99999".
 const MAX_TO: u32 = 100_000;
