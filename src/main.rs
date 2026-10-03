@@ -4,7 +4,7 @@
 //!     ?from= and ?to= to scan a sub-range instead. The range is half-open:
 //!     from is inclusive, to is exclusive, both within 00000..99999
 //!     (to may be 100000 to include 99999).
-//!   - 50 concurrent in-flight requests
+//!   - 5 concurrent in-flight requests (the site 409s anything much higher)
 //!   - 10 retries with exponential backoff per code
 //!   - Body sniff for "Restaurant Code is not valid." → not valid; anything
 //!     else means we found a hit
@@ -32,7 +32,9 @@ use tokio::sync::Mutex;
 const TARGET_URL: &str = "https://checktodine.com/customer_waitlist.php?businessid=110";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
-const MAX_CONCURRENT: usize = 50;
+/// Kept low on purpose: the site answers 409 Conflict / drops connections
+/// when it sees a burst of concurrent requests from one IP.
+const MAX_CONCURRENT: usize = 5;
 const INVALID_MARKER: &str = "Restaurant Code is not valid.";
 /// Exclusive upper bound for `to`: 100000 means "up to and including 99999".
 const MAX_TO: u32 = 100_000;
