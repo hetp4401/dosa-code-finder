@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dosa Orchestrator</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #14100b; color: #f5ead9; max-width: 900px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.4rem; }
+  .card { background: #1f1811; border: 1px solid #3a2d1c; border-radius: 12px; padding: 16px; margin: 12px 0; }
+  #activeBanner { display: none; background: #2a1f0e; border: 2px solid #e8912d; border-radius: 12px; padding: 16px; margin: 12px 0; }
+  #activeBanner.show { display: block; }
+  #activeBanner .banner-title { font-weight: 700; color: #e8912d; margin-bottom: 8px; }
+  #activeBanner button { width: auto; padding: 10px 24px; margin-top: 8px; }
+  label { display: block; font-size: .85rem; opacity: .8; margin: 8px 0 4px; }
+  input { width: 100%; box-sizing: border-box; padding: 10px; font-size: 1rem; border-radius: 8px; border: 1px solid #3a2d1c; background: #14100b; color: inherit; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  .btnrow { display: flex; gap: 12px; }
+  .btnrow > button { flex: 1; }
+  button { width: 100%; margin-top: 12px; padding: 12px; font-size: 1rem; border: 0; border-radius: 8px; background: #e8912d; color: #1a1206; font-weight: 700; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.stop { background: #a33327; color: #ffe9e4; }
+  .bar { height: 10px; background: #14100b; border-radius: 6px; overflow: hidden; margin-top: 8px; }
+  .bar > div { height: 100%; background: #e8912d; width: 0%; transition: width .3s; }
+  .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+  .found { color: #7ddf8a; font-weight: 700; }
+  .err { color: #ff9a9a; min-height: 1.2em; font-size: .9rem; margin-top: 8px; }
+  .k { opacity: .65; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+  .v { font-size: 1.1rem; margin: 2px 0 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-top: 10px; }
+  .rep { background: #14100b; border: 1px solid #3a2d1c; border-radius: 8px; padding: 10px; font-size: .85rem; }
+  .rep .id { font-weight: 700; }
+  .rep .st { float: right; text-transform: uppercase; font-size: .7rem; letter-spacing: .05em; }
+  .st-running { color: #e8912d; }
+  .st-done { color: #7ddf8a; }
+  .st-failed { color: #ff9a9a; }
+  .st-pending { color: #9ab8ff; }
+  .st-idle { color: #9ab8ff; }
+  .st-working { color: #e8912d; }
+  .st-cooldown { color: #c9a0ff; }
+  .rep .seg { opacity: .75; margin: 4px 0; }
+  .rep .prog { font-family: ui-monospace, monospace; }
+  .rep .rerr { color: #ff9a9a; font-size: .75rem; word-break: break-word; margin-top: 4px; }
+  .rep .rate { opacity: .6; font-size: .75rem; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<h1>🥘 Dosa Orchestrator</h1><p style="opacity:.7;font-size:.9rem">Orchestrating from this replica · <a href="/" style="color:#e8912d">worker view</a></p>
+<div id="activeBanner">
+  <div class="banner-title">🔄 Scan in progress</div>
+  <div class="mono" id="bannerProgress">—</div>
+  <button id="bannerStop" class="stop">Stop scan</button>
+</div>
+<div class="card">
+  <div class="row">
+    <div><label for="from">From (inclusive)</label><input id="from" type="number" min="0" max="99999" value="0"></div>
+    <div><label for="to">To (exclusive)</label><input id="to" type="number" min="1" max="100000" value="100000"></div>
+    <div><label for="replicas">Replicas</label><input id="replicas" type="number" min="1" max="20" value="20"></div>
+  </div>
+  <div class="btnrow">
+    <button id="start">Start scan</button>
+    <button id="stop" class="stop" disabled>Stop</button>
+  </div>
+  <div class="err" id="err"></div>
+</div>
+<div class="card">
+  <div class="k">State</div><div class="v" id="state">—</div>
+  <div class="k">Range</div><div class="v mono" id="range">—</div>
+  <div class="k">Progress</div><div class="v mono" id="progress">—</div>
+  <div class="bar"><div id="barfill"></div></div>
+  <div class="k" style="margin-top:10px">Valid code</div><div class="v mono" id="valid">—</div>
+  <div class="k">Queued</div><div class="v mono" id="queued" style="font-size:.95rem">—</div>
+  <div class="k">Message</div><div class="v" id="msg" style="font-size:.95rem">—</div>
+</div>
+<div class="card">
+  <div class="k">Found codes history</div>
+  <div id="history" class="mono" style="font-size:.9rem">—</div>
+</div>
+<div class="card">
+  <div class="k">Replicas</div>
+  <div class="grid" id="grid"></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const startBtn = $('start'), stopBtn = $('stop'), errEl = $('err');
+
+function clamp(v, lo, hi) {
+  v = Math.floor(Number(v));
+  if (!Number.isFinite(v)) return lo;
+  return Math.min(hi, Math.max(lo, v));
+}
+
+let pollInFlight = false;
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function repCard(r) {
+  const stLabel = r.state === 'cooldown' ? 'cooldown' : r.state;
+  return `<div class="rep">
+    <span class="id">#${r.id}</span>
+    <span class="st st-${r.state === 'working' ? 'running' : r.state}">${stLabel}</span>
+    <div class="prog">${r.tried.toLocaleString()} tried</div>
+    <div class="rate">buf ${r.buffer_len} · ${r.rate != null ? r.rate + '/s' : ''}</div>
+    ${r.last_error ? `<div class="rerr">${esc(r.last_error)}</div>` : ''}
+  </div>`;
+}
+
+async function refresh() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const r = await fetch('/orchestrate/status');
+    if (!r.ok) return;
+    const s = await r.json();
+    const stateLabel = s.running ? 'Running' :
+      (s.state === 'done' && s.found ? 'Done — found!' :
+       s.state === 'done' ? 'Done' :
+       s.state === 'failed' ? 'Failed' :
+       s.state === 'stopped' ? 'Stopped' : 'Idle');
+    $('state').textContent = stateLabel;
+    $('range').textContent = s.range || '—';
+    const pct = s.total > 0 ? Math.min(100, Math.floor(100 * s.tried / s.total)) : 0;
+    $('progress').textContent = s.total > 0
+      ? `${s.tried.toLocaleString()} / ${s.total.toLocaleString()} (${pct}%)`
+      : '—';
+    $('barfill').style.width = pct + '%';
+    const validEl = $('valid');
+    validEl.textContent = s.valid_code || '—';
+    validEl.classList.toggle('found', !!s.found);
+    $('msg').textContent = s.message || '—';
+    $('queued').textContent = s.queued != null ? s.queued.toLocaleString() + ' codes' : '—';
+    // History.
+    const hist = s.history || [];
+    $('history').innerHTML = hist.length
+      ? hist.slice().reverse().map(h =>
+          `<div>✅ <b>${esc(h.code)}</b> — ${esc(h.found_at)} — range ${esc(h.range)} — replica #${h.replica}</div>`
+        ).join('')
+      : '—';
+    $('grid').innerHTML = (s.replicas || []).map(repCard).join('');
+    startBtn.disabled = s.running;
+    startBtn.textContent = s.running ? 'Scanning…' : 'Start scan';
+    stopBtn.disabled = !s.running;
+    // Active scan banner.
+    const banner = $('activeBanner');
+    if (s.running) {
+      banner.classList.add('show');
+      const pct = s.total > 0 ? Math.min(100, Math.floor(100 * s.tried / s.total)) : 0;
+      $('bannerProgress').textContent =
+        `${s.range || ''} — ${s.tried.toLocaleString()} / ${s.total.toLocaleString()} (${pct}%)`;
+    } else {
+      banner.classList.remove('show');
+    }
+  } catch (e) { /* keep last state on poll failure */ }
+  pollInFlight = false;
+}
+
+startBtn.addEventListener('click', async () => {
+  errEl.textContent = '';
+  const from = clamp($('from').value, 0, 99999);
+  const to = clamp($('to').value, 1, 100000);
+  const n = clamp($('replicas').value, 1, 20);
+  $('from').value = from; $('to').value = to; $('replicas').value = n;
+  if (from >= to) { errEl.textContent = 'Need From < To (To is exclusive).'; return; }
+  startBtn.disabled = true;
+  let started = false;
+  try {
+    const r = await fetch(`/orchestrate/start?from=${from}&to=${to}&replicas=${n}`);
+    const body = await r.json().catch(() => null);
+    if (!body) {
+      errEl.textContent = `Unexpected server response (${r.status}).`;
+    } else if (!r.ok || !body.ok) {
+      errEl.textContent = body.error || `Server error (${r.status}).`;
+    } else {
+      started = true;
+    }
+  } catch (e) { errEl.textContent = 'Could not reach server.'; }
+  if (!started) startBtn.disabled = false;
+  refresh();
+});
+
+stopBtn.addEventListener('click', async () => {
+  errEl.textContent = '';
+  stopBtn.disabled = true;
+  try {
+    const r = await fetch('/orchestrate/stop');
+    const body = await r.json().catch(() => null);
+    if (body && body.message) errEl.textContent = body.message;
+  } catch (e) { errEl.textContent = 'Could not reach server.'; }
+  refresh();
+});
+
+$('bannerStop').addEventListener('click', async () => {
+  errEl.textContent = '';
+  try {
+    await fetch('/orchestrate/stop');
+  } catch (e) { errEl.textContent = 'Could not reach server.'; }
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
