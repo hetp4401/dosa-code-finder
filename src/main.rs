@@ -1023,17 +1023,27 @@ async fn orch_start_handler(
 }
 
 /// GET /orchestrate/stop — stops the orchestrator and all workers.
+/// Also stops the local worker role if it's running.
 async fn orch_stop_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if !state.orch_running.load(Ordering::SeqCst) {
+    let was_orchestrating = state.orch_running.swap(false, Ordering::SeqCst);
+    let was_working = state.is_running.load(Ordering::SeqCst);
+
+    if !was_orchestrating && !was_working {
         return (
             StatusCode::OK,
-            Json(json!({"ok": true, "message": "not orchestrating"})),
+            Json(json!({"ok": true, "message": "nothing running"})),
         );
     }
-    state.orch_running.store(false, Ordering::SeqCst);
-    *state.orch_message.lock().await = "stopped by user".to_string();
 
-    // Stop all workers.
+    if was_orchestrating {
+        *state.orch_message.lock().await = "stopped by user".to_string();
+    }
+    if was_working {
+        // Stop the local worker role too.
+        state.stop_requested.store(true, Ordering::SeqCst);
+    }
+
+    // Stop all worker replicas (if orchestrating).
     let urls: Vec<String> = {
         let reps = state.orch_replicas.lock().await;
         reps.iter().map(|r| r.url.clone()).collect()
@@ -1048,7 +1058,7 @@ async fn orch_stop_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "message": "orchestrator stop requested"})),
+        Json(json!({"ok": true, "message": "stop requested (orchestrator and worker)"})),
     )
 }
 
