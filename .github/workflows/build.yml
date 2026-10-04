@@ -1,7 +1,7 @@
 name: build
 
 # Every push to main builds the image once, publishes it to ghcr.io, and deploys it to the fleet
-# (https://control.billybishop4-workers.xyz), where every machine just pulls it.
+# (https://runners.billybishop4-workers.xyz), where every machine just pulls it.
 on:
   push:
     branches: [main]
@@ -39,7 +39,7 @@ jobs:
       - name: Deploy to the fleet
         shell: bash # a failed curl or jq fails the step, instead of a green run that deployed nothing
         env:
-          URL: https://control.billybishop4-workers.xyz/api/projects/dosa-code-finder
+          URL: https://runners.billybishop4-workers.xyz/api/projects/dosa-code-finder
         run: |
           # Deploying needs no credentials (the app isn't locked). Keep the replica count the fleet already has (1 for a first deploy).
           replicas=$(curl -fsS "$URL" | jq -e '.replicas') || replicas=1
