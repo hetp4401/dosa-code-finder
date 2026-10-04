@@ -54,12 +54,12 @@ const ORCH_STALL_TIMEOUT_SECS: u64 = 120;
 /// Cooldown for a stalled replica (suspected throttling).
 const ORCH_COOLDOWN_SECS: u64 = 180;
 
-/// Number of replicas in the fleet. Configured via REPLICA_COUNT env (default 20).
+/// Number of replicas in the fleet. Configured via REPLICA_COUNT env (default 35).
 fn replica_count() -> u32 {
     std::env::var("REPLICA_COUNT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20)
+        .unwrap_or(35)
 }
 
 /// Majority quorum for the replica count.
