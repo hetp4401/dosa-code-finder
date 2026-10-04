@@ -272,6 +272,13 @@ async fn try_all(state: AppState, from: u32, to: u32) {
         .for_each_concurrent(BUFFER_WORKERS, |code| {
             let st = state.clone();
             async move {
+                // Check stop BEFORE waiting for a permit, so a stop request
+                // doesn't have to drain the rate limiter.
+                if st.code_found.load(Ordering::Relaxed)
+                    || st.stop_requested.load(Ordering::Relaxed)
+                {
+                    return;
+                }
                 // Wait for a rate-limiter permit (steady 100/sec, no burst).
                 st.limiter.until_ready().await;
                 let _ = submit(st.clone(), code).await;
