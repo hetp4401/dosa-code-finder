@@ -459,11 +459,14 @@ async fn orchestrator_task(state: AppState, from: u32, to: u32, n_replicas: u32)
         {
             let q_empty = state.orch_queue.lock().await.is_empty();
             if q_empty {
-                let reps = state.orch_replicas.lock().await;
+                let mut reps = state.orch_replicas.lock().await;
                 let all_drained = reps.iter().all(|r| r.buffer_len == 0);
                 if all_drained {
-                    // Stop all workers.
+                    // Stop all workers and mark idle.
                     let urls: Vec<String> = reps.iter().map(|r| r.url.clone()).collect();
+                    for r in reps.iter_mut() {
+                        r.state = "idle".to_string();
+                    }
                     drop(reps);
                     for url in urls {
                         let c = state.client.clone();
