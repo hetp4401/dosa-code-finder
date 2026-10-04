@@ -53,11 +53,21 @@ const ORCH_REFILL_THRESHOLD: usize = 200;
 const ORCH_STALL_TIMEOUT_SECS: u64 = 120;
 /// Cooldown for a stalled replica (suspected throttling).
 const ORCH_COOLDOWN_SECS: u64 = 180;
-/// Majority of replicas needed for the pre-start quorum check.
-const ORCH_QUORUM: usize = 11;
-const ORCH_REPLICA_COUNT: u32 = 20;
 
-/// Base URL template for replicas. {i} is replaced with 1..=20.
+/// Number of replicas in the fleet. Configured via REPLICA_COUNT env (default 20).
+fn replica_count() -> u32 {
+    std::env::var("REPLICA_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
+
+/// Majority quorum for the replica count.
+fn orch_quorum() -> usize {
+    (replica_count() as usize / 2) + 1
+}
+
+/// Base URL template for replicas. {i} is replaced with 1..=replica_count().
 fn replica_base() -> String {
     std::env::var("REPLICA_BASE")
         .unwrap_or_else(|_| "https://dosa-{i}.billybishop4-workers.xyz".to_string())
@@ -300,7 +310,7 @@ async fn try_all(state: AppState, from: u32, to: u32) {
 async fn check_majority_idle(client: &Client) -> Result<(), String> {
     use futures::stream::{self, StreamExt};
 
-    let urls: Vec<String> = (1..=ORCH_REPLICA_COUNT).map(replica_url).collect();
+    let urls: Vec<String> = (1..=replica_count()).map(replica_url).collect();
 
     let results: Vec<Result<bool, ()>> = stream::iter(urls)
         .map(|url| {
@@ -338,9 +348,11 @@ async fn check_majority_idle(client: &Client) -> Result<(), String> {
             "{busy_count} replica(s) report an active scan; only one orchestrator may run"
         ));
     }
-    if idle_count < ORCH_QUORUM {
+    if idle_count < orch_quorum() {
+        let q = orch_quorum();
+        let total = replica_count();
         return Err(format!(
-            "only {idle_count}/20 replicas confirmed idle, need majority ({ORCH_QUORUM})"
+            "only {idle_count}/{total} replicas confirmed idle, need majority ({q})"
         ));
     }
     Ok(())
@@ -948,6 +960,7 @@ struct OrchStatus {
     tried: u64,
     total: u64,
     queued: usize,
+    replica_count: u32,
     replicas: Vec<OrchReplicaStatus>,
 }
 
@@ -980,7 +993,10 @@ async fn orch_start_handler(
     };
     let from = params.from.unwrap_or(0);
     let to = params.to.unwrap_or(100_000);
-    let n = params.replicas.unwrap_or(20).clamp(1, ORCH_REPLICA_COUNT);
+    let n = params
+        .replicas
+        .unwrap_or_else(replica_count)
+        .clamp(1, replica_count());
     if from >= to || to > 100_000 {
         return (
             StatusCode::BAD_REQUEST,
@@ -1101,6 +1117,7 @@ async fn orch_status_handler(State(state): State<AppState>) -> Json<OrchStatus> 
         tried,
         total,
         queued,
+        replica_count: replica_count(),
         replicas: rep_status,
     })
 }

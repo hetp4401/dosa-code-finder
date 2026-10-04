@@ -57,7 +57,7 @@
   <div class="row">
     <div><label for="from">From (inclusive)</label><input id="from" type="number" min="0" max="99999" value="0"></div>
     <div><label for="to">To (exclusive)</label><input id="to" type="number" min="1" max="100000" value="100000"></div>
-    <div><label for="replicas">Replicas</label><input id="replicas" type="number" min="1" max="20" value="20"></div>
+    <div><label for="replicas">Replicas</label><input id="replicas" type="number" min="1" max="25" value="25"></div>
   </div>
   <div class="btnrow">
     <button id="start">Start scan</button>
@@ -142,6 +142,12 @@ async function refresh() {
         ).join('')
       : '—';
     $('grid').innerHTML = (s.replicas || []).map(repCard).join('');
+    // Sync the replica count from the backend (fleet may scale).
+    if (s.replica_count) {
+      const rc = $('replicas');
+      rc.max = s.replica_count;
+      if (+rc.value > s.replica_count) rc.value = s.replica_count;
+    }
     startBtn.disabled = s.running;
     startBtn.textContent = s.running ? 'Scanning…' : 'Start scan';
     stopBtn.disabled = !s.running;
@@ -163,7 +169,8 @@ startBtn.addEventListener('click', async () => {
   errEl.textContent = '';
   const from = clamp($('from').value, 0, 99999);
   const to = clamp($('to').value, 1, 100000);
-  const n = clamp($('replicas').value, 1, 20);
+  const maxRep = +($('replicas').max || 20);
+  const n = clamp($('replicas').value, 1, maxRep);
   $('from').value = from; $('to').value = to; $('replicas').value = n;
   if (from >= to) { errEl.textContent = 'Need From < To (To is exclusive).'; return; }
   startBtn.disabled = true;
