@@ -60,7 +60,7 @@ const ORCH_REPLICA_COUNT: u32 = 20;
 /// Base URL template for replicas. {i} is replaced with 1..=20.
 fn replica_base() -> String {
     std::env::var("REPLICA_BASE")
-        .unwrap_or_else(|_| "https://dosa-code-finder-{i}.billybishop4-workers.xyz".to_string())
+        .unwrap_or_else(|_| "https://dosa-{i}.billybishop4-workers.xyz".to_string())
 }
 
 fn replica_url(id: u32) -> String {
