@@ -1092,10 +1092,6 @@ async fn root_handler() -> Html<&'static str> {
     Html(include_str!("index.html"))
 }
 
-async fn worker_page_handler() -> Html<&'static str> {
-    Html(include_str!("worker.html"))
-}
-
 async fn orchestrate_page_handler() -> Html<&'static str> {
     Html(include_str!("orchestrate.html"))
 }
@@ -1159,7 +1155,6 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(root_handler))
-        .route("/worker", get(worker_page_handler))
         .route("/start", get(start_handler))
         .route("/stop", get(stop_handler))
         .route("/status", get(status_handler))
