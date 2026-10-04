@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dosa Code Finder</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #14100b; color: #f5ead9; max-width: 560px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.4rem; }
+  .card { background: #1f1811; border: 1px solid #3a2d1c; border-radius: 12px; padding: 16px; margin: 12px 0; }
+  label { display: block; font-size: .85rem; opacity: .8; margin: 8px 0 4px; }
+  input { width: 100%; box-sizing: border-box; padding: 10px; font-size: 1rem; border-radius: 8px; border: 1px solid #3a2d1c; background: #14100b; color: inherit; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  button { width: 100%; margin-top: 12px; padding: 12px; font-size: 1rem; border: 0; border-radius: 8px; background: #e8912d; color: #1a1206; font-weight: 700; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.stop { background: #a33327; color: #ffe9e4; }
+  .btnrow { display: flex; gap: 12px; }
+  .btnrow > button { flex: 1; }
+  .bar { height: 10px; background: #14100b; border-radius: 6px; overflow: hidden; margin-top: 8px; }
+  .bar > div { height: 100%; background: #e8912d; width: 0%; transition: width .3s; }
+  .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+  .found { color: #7ddf8a; font-weight: 700; }
+  .err { color: #ff9a9a; min-height: 1.2em; font-size: .9rem; margin-top: 8px; }
+  .k { opacity: .65; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+  .v { font-size: 1.1rem; margin: 2px 0 10px; }
+</style>
+</head>
+<body>
+<h1>🥘 Dosa Code Finder</h1>
+<div class="card">
+  <div class="row">
+    <div><label for="from">From (inclusive)</label><input id="from" type="number" min="0" max="99999" value="0"></div>
+    <div><label for="to">To (exclusive)</label><input id="to" type="number" min="1" max="100000" value="100000"></div>
+  </div>
+  <div class="btnrow">
+    <button id="start">Start scan</button>
+    <button id="stop" class="stop" disabled>Stop</button>
+  </div>
+  <div class="err" id="err"></div>
+</div>
+<div class="card">
+  <div class="k">State</div><div class="v" id="state">—</div>
+  <div class="k">Range</div><div class="v mono" id="range">—</div>
+  <div class="k">Progress</div><div class="v mono" id="progress">—</div>
+  <div class="bar"><div id="barfill"></div></div>
+  <div class="k" style="margin-top:10px">Trying now</div><div class="v mono" id="trial">—</div>
+  <div class="k">Valid code</div><div class="v mono" id="valid">—</div>
+</div>
+<div class="card">
+  <div class="k">Attempts</div><div class="v mono" id="attempts" style="font-size:.95rem">—</div>
+  <div class="k">Last error</div><div class="v mono" id="lasterr" style="font-size:.85rem;word-break:break-word">—</div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const startBtn = $('start'), stopBtn = $('stop'), errEl = $('err');
+
+function clamp(v, max) {
+  v = Math.floor(Number(v));
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(max, Math.max(0, v));
+}
+
+let pollInFlight = false;
+
+async function refresh() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const r = await fetch('/status');
+    if (!r.ok) return;
+    const s = await r.json();
+    $('state').textContent = s.running ? 'Running' : (s.found ? 'Done — found!' : 'Idle');
+    $('range').textContent = s.range || '—';
+    const pct = s.total > 0 ? Math.floor(100 * s.tried / s.total) : 0;
+    $('progress').textContent = s.total > 0
+      ? `${s.tried.toLocaleString()} / ${s.total.toLocaleString()} (${pct}%)`
+      : '—';
+    $('barfill').style.width = pct + '%';
+    $('trial').textContent = s.trial_code || '—';
+    const validEl = $('valid');
+    validEl.textContent = s.valid_code || '—';
+    validEl.classList.toggle('found', !!s.found);
+    startBtn.disabled = s.running;
+    startBtn.textContent = s.running ? 'Scanning…' : 'Start scan';
+    stopBtn.disabled = !s.running;
+    $('attempts').textContent =
+      `200:${s.ok_200 ?? 0} 4xx:${s.http_4xx ?? 0} 5xx:${s.http_5xx ?? 0} timeouts:${s.timeouts ?? 0} net:${s.net_errors ?? 0}`;
+    $('lasterr').textContent = s.last_error || '—';
+  } catch (e) { /* keep last state on poll failure */ }
+  pollInFlight = false;
+}
+
+startBtn.addEventListener('click', async () => {
+  errEl.textContent = '';
+  const from = clamp($('from').value, 99999), to = clamp($('to').value, 100000);
+  $('from').value = from; $('to').value = to;
+  if (from >= to) { errEl.textContent = 'Need From < To (To is exclusive).'; return; }
+  startBtn.disabled = true;
+  let started = false;
+  try {
+    const r = await fetch(`/start?from=${from}&to=${to}`);
+    const body = await r.json().catch(() => null);
+    if (!body) {
+      errEl.textContent = `Unexpected server response (${r.status}).`;
+    } else if (!r.ok || !body.ok) {
+      errEl.textContent = body.error || `Server error (${r.status}).`;
+    } else {
+      started = true;
+    }
+  } catch (e) { errEl.textContent = 'Could not reach server.'; }
+  if (!started) startBtn.disabled = false;
+  refresh();
+});
+
+stopBtn.addEventListener('click', async () => {
+  errEl.textContent = '';
+  stopBtn.disabled = true;
+  try {
+    const r = await fetch('/stop');
+    const body = await r.json().catch(() => null);
+    if (body && body.message) errEl.textContent = body.message;
+  } catch (e) { errEl.textContent = 'Could not reach server.'; }
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
