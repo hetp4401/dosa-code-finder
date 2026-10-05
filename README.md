@@ -13,8 +13,8 @@ Run locally: `docker compose -f compose.yaml up` after replacing `__TAG__` with 
 ## The scan cooldown
 
 Before a scan starts (`/start` or `/orchestrate/start`), the replica asks the fleet's key-value store, the `zkmetadata`
-app, when that exact range was last scanned (key `dosa.scan.<from>-<to>`). Within `SCAN_COOLDOWN_HOURS` (6) of that,
-the scan is refused with the last record in the answer. A store that has no record, or can't be reached, lets the scan
-go. Each scan is recorded when it starts and when it ends (found code, tried, stopped), with the password in the app's
-env `ZKMETADATA_PASSWORD`, which is what that key takes for changes. `ZKMETADATA_URLS` (comma-separated) overrides the
-store's URLs; empty turns the check off.
+app, when the last scan started, whatever its range (key `dosa.lastrun`). Within `SCAN_COOLDOWN_HOURS` (6) of that,
+the new scan is refused, with the last record in the answer. A store that has no record, or can't be reached, lets the
+scan go. Each scan is recorded as the last one when it starts and when it ends (found code, tried, stopped), with the
+password in the app's env `ZKMETADATA_PASSWORD`, which is what that key takes for changes. `ZKMETADATA_URLS`
+(comma-separated) overrides the store's URLs; empty turns the check off.

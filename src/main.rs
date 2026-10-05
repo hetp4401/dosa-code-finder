@@ -78,9 +78,9 @@ fn replica_url(id: u32) -> String {
 }
 const INVALID_MARKER: &str = "Restaurant Code is not valid.";
 
-// --- The fleet's key-value store (the zkmetadata app), where the last scan of each range is recorded ---
-// Before a scan starts, the store is asked when that range was last scanned; within the cooldown the scan is refused.
-// A store that can't be reached, or has no record, lets the scan go: it's advice, not a gate on its own.
+// --- The fleet's key-value store (the zkmetadata app), where the last scan is recorded ---
+// Before a scan starts, the store is asked when the last scan started, whatever its range; within the cooldown the new
+// one is refused. A store that can't be reached, or has no record, lets the scan go: it's advice, not a gate on its own.
 
 /// The store's replica URLs, tried in turn (every replica serves the same data). ZKMETADATA_URLS overrides them
 /// (comma-separated); set it empty to turn the check off.
@@ -95,14 +95,13 @@ fn store_urls() -> Vec<String> {
 fn store_password() -> Option<String> {
     std::env::var("ZKMETADATA_PASSWORD").ok().filter(|p| !p.is_empty())
 }
-/// How long after a scan of a range the same range is refused: SCAN_COOLDOWN_HOURS, 6 by default.
+/// How long after a scan starts the next one is refused: SCAN_COOLDOWN_HOURS, 6 by default.
 fn scan_cooldown() -> Duration {
     let hours = std::env::var("SCAN_COOLDOWN_HOURS").ok().and_then(|h| h.parse::<f64>().ok()).unwrap_or(6.0);
     Duration::from_secs((hours * 3600.0) as u64)
 }
-fn scan_key(from: u32, to: u32) -> String {
-    format!("dosa.scan.{from:05}-{to:05}")
-}
+/// The one key: the last scan, whatever its range.
+const SCAN_KEY: &str = "dosa.lastrun";
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -125,10 +124,9 @@ fn utc_text(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60, rem % 60)
 }
 
-/// The store's record of the last scan of this range: Some(record) when it has one, None when it has none or can't be
-/// reached.
-async fn last_scan(client: &Client, from: u32, to: u32) -> Option<serde_json::Value> {
-    let key = scan_key(from, to);
+/// The store's record of the last scan: Some(record) when it has one, None when it has none or can't be reached.
+async fn last_scan(client: &Client) -> Option<serde_json::Value> {
+    let key = SCAN_KEY;
     let urls = store_urls();
     if urls.is_empty() {
         return None;
@@ -146,9 +144,9 @@ async fn last_scan(client: &Client, from: u32, to: u32) -> Option<serde_json::Va
     None
 }
 
-/// Why a scan of this range may not start now, as a JSON error: it was scanned within the cooldown. None lets it go.
-async fn scan_refused(client: &Client, from: u32, to: u32) -> Option<serde_json::Value> {
-    let last = last_scan(client, from, to).await?;
+/// Why a scan may not start now, as a JSON error: one started within the cooldown. None lets it go.
+async fn scan_refused(client: &Client) -> Option<serde_json::Value> {
+    let last = last_scan(client).await?;
     let at = last.get("at").and_then(|v| v.as_u64())?;
     let age = now_unix().saturating_sub(at);
     let cooldown = scan_cooldown().as_secs();
@@ -157,21 +155,25 @@ async fn scan_refused(client: &Client, from: u32, to: u32) -> Option<serde_json:
     }
     let by = last.get("by").and_then(|b| b.as_str()).filter(|b| !b.is_empty()).map(|b| format!(" by {b}")).unwrap_or_default();
     let status = last.get("status").and_then(|b| b.as_str()).unwrap_or("recorded");
+    let range = match (last.get("from").and_then(|v| v.as_u64()), last.get("to").and_then(|v| v.as_u64())) {
+        (Some(f), Some(t)) => format!("{f:05}..{t:05}"),
+        _ => "a scan".to_string(),
+    };
     Some(json!({
         "ok": false,
-        "error": format!("{from:05}..{to:05} was scanned {} ago{by} ({status}); the same range is allowed again in {}", human_secs(age), human_secs(cooldown - age)),
+        "error": format!("{range} was started {} ago{by} ({status}); the next scan is allowed in {}", human_secs(age), human_secs(cooldown - age)),
         "last": last,
     }))
 }
 
-/// Records a scan of this range in the store: `at` is when it started (what the cooldown counts from), `status` and
-/// `extra` say how it's going. Made with dosa's password the first time, changed with it afterwards.
+/// Records the scan in the store as the last one: `at` is when it started (what the cooldown counts from), `status`
+/// and `extra` say how it's going. Made with dosa's password the first time, changed with it afterwards.
 async fn record_scan(client: &Client, from: u32, to: u32, started_at: u64, status: &str, extra: serde_json::Value) {
     let Some(password) = store_password() else {
         println!("store: ZKMETADATA_PASSWORD isn't set, so this scan isn't recorded");
         return;
     };
-    let key = scan_key(from, to);
+    let key = SCAN_KEY;
     let mut value = json!({
         "at": started_at, "at_text": utc_text(started_at), "from": from, "to": to, "status": status,
         "updated_text": utc_text(now_unix()), "by": std::env::var("FLEET_HOST").unwrap_or_default(),
@@ -1020,8 +1022,8 @@ async fn start_handler(
             Json(json!({"ok": false, "error": "bad range: need 0 <= from < to <= 100000 (from inclusive, to exclusive)"})),
         );
     }
-    // The store: not again within the cooldown.
-    if let Some(refusal) = scan_refused(&state.client, from, to).await {
+    // The store: no scan within the cooldown of the last one.
+    if let Some(refusal) = scan_refused(&state.client).await {
         return (StatusCode::CONFLICT, Json(refusal));
     }
     // Atomic single-flight reservation: exactly one scan runs at a time.
@@ -1159,8 +1161,8 @@ async fn orch_start_handler(
         }
     }
 
-    // The store: not again within the cooldown.
-    if let Some(refusal) = scan_refused(&state.client, from, to).await {
+    // The store: no scan within the cooldown of the last one.
+    if let Some(refusal) = scan_refused(&state.client).await {
         return (StatusCode::CONFLICT, Json(refusal));
     }
 
