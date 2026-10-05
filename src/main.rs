@@ -77,6 +77,124 @@ fn replica_url(id: u32) -> String {
     replica_base().replace("{i}", &id.to_string())
 }
 const INVALID_MARKER: &str = "Restaurant Code is not valid.";
+
+// --- The fleet's key-value store (the zkmetadata app), where the last scan of each range is recorded ---
+// Before a scan starts, the store is asked when that range was last scanned; within the cooldown the scan is refused.
+// A store that can't be reached, or has no record, lets the scan go: it's advice, not a gate on its own.
+
+/// The store's replica URLs, tried in turn (every replica serves the same data). ZKMETADATA_URLS overrides them
+/// (comma-separated); set it empty to turn the check off.
+fn store_urls() -> Vec<String> {
+    match std::env::var("ZKMETADATA_URLS") {
+        Ok(v) => v.split(',').map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()).collect(),
+        Err(_) => (1..=11).map(|k| format!("https://zkmetadata-{k}.billybishop4-workers.xyz")).collect(),
+    }
+}
+/// The password of dosa's keys in the store: set on the first record, checked on every later one. Without it, scans
+/// are still checked against the store but not recorded.
+fn store_password() -> Option<String> {
+    std::env::var("ZKMETADATA_PASSWORD").ok().filter(|p| !p.is_empty())
+}
+/// How long after a scan of a range the same range is refused: SCAN_COOLDOWN_HOURS, 6 by default.
+fn scan_cooldown() -> Duration {
+    let hours = std::env::var("SCAN_COOLDOWN_HOURS").ok().and_then(|h| h.parse::<f64>().ok()).unwrap_or(6.0);
+    Duration::from_secs((hours * 3600.0) as u64)
+}
+fn scan_key(from: u32, to: u32) -> String {
+    format!("dosa.scan.{from:05}-{to:05}")
+}
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+fn human_secs(s: u64) -> String {
+    if s >= 3600 { format!("{}h {}m", s / 3600, (s % 3600) / 60) } else if s >= 60 { format!("{}m", s / 60) } else { format!("{s}s") }
+}
+/// "2026-10-05 20:30:00 UTC" for a unix time (the civil-from-days arithmetic, so no date crate is needed).
+fn utc_text(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// The store's record of the last scan of this range: Some(record) when it has one, None when it has none or can't be
+/// reached.
+async fn last_scan(client: &Client, from: u32, to: u32) -> Option<serde_json::Value> {
+    let key = scan_key(from, to);
+    let urls = store_urls();
+    if urls.is_empty() {
+        return None;
+    }
+    let first = (now_unix() as usize) % urls.len();
+    for i in 0..urls.len().min(3) {
+        let url = &urls[(first + i) % urls.len()];
+        match client.get(format!("{url}/kv/{key}")).timeout(Duration::from_secs(4)).send().await {
+            Ok(res) if res.status() == StatusCode::NOT_FOUND => return None,
+            Ok(res) if res.status().is_success() => return res.json::<serde_json::Value>().await.ok(),
+            Ok(res) => println!("store: {url} answered {} for {key}", res.status()),
+            Err(e) => println!("store: {url} unreachable: {e}"),
+        }
+    }
+    None
+}
+
+/// Why a scan of this range may not start now, as a JSON error: it was scanned within the cooldown. None lets it go.
+async fn scan_refused(client: &Client, from: u32, to: u32) -> Option<serde_json::Value> {
+    let last = last_scan(client, from, to).await?;
+    let at = last.get("at").and_then(|v| v.as_u64())?;
+    let age = now_unix().saturating_sub(at);
+    let cooldown = scan_cooldown().as_secs();
+    if age >= cooldown {
+        return None;
+    }
+    let by = last.get("by").and_then(|b| b.as_str()).filter(|b| !b.is_empty()).map(|b| format!(" by {b}")).unwrap_or_default();
+    let status = last.get("status").and_then(|b| b.as_str()).unwrap_or("recorded");
+    Some(json!({
+        "ok": false,
+        "error": format!("{from:05}..{to:05} was scanned {} ago{by} ({status}); the same range is allowed again in {}", human_secs(age), human_secs(cooldown - age)),
+        "last": last,
+    }))
+}
+
+/// Records a scan of this range in the store: `at` is when it started (what the cooldown counts from), `status` and
+/// `extra` say how it's going. Made with dosa's password the first time, changed with it afterwards.
+async fn record_scan(client: &Client, from: u32, to: u32, started_at: u64, status: &str, extra: serde_json::Value) {
+    let Some(password) = store_password() else {
+        println!("store: ZKMETADATA_PASSWORD isn't set, so this scan isn't recorded");
+        return;
+    };
+    let key = scan_key(from, to);
+    let mut value = json!({
+        "at": started_at, "at_text": utc_text(started_at), "from": from, "to": to, "status": status,
+        "updated_text": utc_text(now_unix()), "by": std::env::var("FLEET_HOST").unwrap_or_default(),
+    });
+    if let (Some(v), Some(e)) = (value.as_object_mut(), extra.as_object()) {
+        for (k, x) in e {
+            v.insert(k.clone(), x.clone());
+        }
+    }
+    let urls = store_urls();
+    if urls.is_empty() {
+        return;
+    }
+    let first = (now_unix() as usize) % urls.len();
+    for i in 0..urls.len().min(3) {
+        let url = &urls[(first + i) % urls.len()];
+        match client.put(format!("{url}/kv/{key}")).timeout(Duration::from_secs(4)).header("x-password", &password).body(value.to_string()).send().await {
+            Ok(res) if res.status().is_success() => return,
+            Ok(res) => println!("store: {url} refused the record for {key}: {} {}", res.status(), res.text().await.unwrap_or_default()),
+            Err(e) => println!("store: {url} unreachable: {e}"),
+        }
+    }
+}
 /// Exclusive upper bound for `to`: 100000 means "up to and including 99999".
 const MAX_TO: u32 = 100_000;
 
@@ -902,6 +1020,10 @@ async fn start_handler(
             Json(json!({"ok": false, "error": "bad range: need 0 <= from < to <= 100000 (from inclusive, to exclusive)"})),
         );
     }
+    // The store: not again within the cooldown.
+    if let Some(refusal) = scan_refused(&state.client, from, to).await {
+        return (StatusCode::CONFLICT, Json(refusal));
+    }
     // Atomic single-flight reservation: exactly one scan runs at a time.
     if state.is_running.swap(true, Ordering::SeqCst) {
         return (
@@ -919,7 +1041,14 @@ async fn start_handler(
 
     tokio::spawn(async move {
         let _guard = guard;
-        try_all(state, from, to).await;
+        let started_at = now_unix();
+        record_scan(&state.client, from, to, started_at, "running", json!({"mode": "single"})).await;
+        try_all(state.clone(), from, to).await;
+        let found = state.code_found.load(Ordering::Relaxed);
+        let stopped = state.stop_requested.load(Ordering::Relaxed);
+        let code = state.valid_code.lock().await.clone();
+        record_scan(&state.client, from, to, started_at, if stopped { "stopped" } else { "finished" },
+            json!({"mode": "single", "found": found, "code": if found { code } else { String::new() }, "tried": state.tried.load(Ordering::Relaxed)})).await;
     });
     (
         StatusCode::OK,
@@ -1030,6 +1159,11 @@ async fn orch_start_handler(
         }
     }
 
+    // The store: not again within the cooldown.
+    if let Some(refusal) = scan_refused(&state.client, from, to).await {
+        return (StatusCode::CONFLICT, Json(refusal));
+    }
+
     // Claim orchestration.
     state.orch_running.store(true, Ordering::SeqCst);
     state.orch_found.store(false, Ordering::SeqCst);
@@ -1038,7 +1172,14 @@ async fn orch_start_handler(
 
     let st = state.clone();
     tokio::spawn(async move {
-        orchestrator_task(st, from, to, n).await;
+        let started_at = now_unix();
+        record_scan(&st.client, from, to, started_at, "running", json!({"mode": "orchestrated", "replicas": n})).await;
+        orchestrator_task(st.clone(), from, to, n).await;
+        let found = st.orch_found.load(Ordering::SeqCst);
+        let code = st.orch_valid_code.lock().await.clone();
+        let message = st.orch_message.lock().await.clone();
+        record_scan(&st.client, from, to, started_at, "finished",
+            json!({"mode": "orchestrated", "replicas": n, "found": found, "code": if found { code } else { String::new() }, "message": message})).await;
     });
 
     let msg = format!("orchestrating {from:05}..{to:05} over {n} replicas");

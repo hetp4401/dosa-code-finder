@@ -9,3 +9,12 @@ A small Rust (axum) service. Every push to `main` builds the image once in GitHu
 - The deploy step needs the repo secret `FLEET_PASSWORD` (the fleet's password).
 
 Run locally: `docker compose -f compose.yaml up` after replacing `__TAG__` with `latest`, or `cargo run`.
+
+## The scan cooldown
+
+Before a scan starts (`/start` or `/orchestrate/start`), the replica asks the fleet's key-value store, the `zkmetadata`
+app, when that exact range was last scanned (key `dosa.scan.<from>-<to>`). Within `SCAN_COOLDOWN_HOURS` (6) of that,
+the scan is refused with the last record in the answer. A store that has no record, or can't be reached, lets the scan
+go. Each scan is recorded when it starts and when it ends (found code, tried, stopped), with the password in the app's
+env `ZKMETADATA_PASSWORD`, which is what that key takes for changes. `ZKMETADATA_URLS` (comma-separated) overrides the
+store's URLs; empty turns the check off.
