@@ -5,5 +5,5 @@ services:
   app:
     image: ghcr.io/hetp4401/dosa-code-finder:__TAG__
     ports: ["3000:3000"]
-    env_file: .env # the fleet's FLEET_* variables and the app's env (ZKMETADATA_PASSWORD)
+    env_file: .env # the fleet's FLEET_* variables (FLEET_REPLICA: which replica this is) and the app's env
     restart: unless-stopped
