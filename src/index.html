@@ -61,7 +61,7 @@
   </div>
   <div class="btnrow">
     <button id="start">Start scan</button>
-    <button id="stop" class="stop" disabled>Stop</button>
+    <button id="stop" class="stop">Stop</button>
   </div>
   <div class="err" id="err"></div>
 </div>
@@ -121,6 +121,8 @@ function errText(st) {
 async function refresh() {
   if (pollInFlight) return;
   pollInFlight = true;
+  // Stop is always clickable, even if this poll fails.
+  stopBtn.disabled = false;
   try {
     const r = await fetch('/orchestrate/status');
     if (!r.ok) return;
@@ -154,9 +156,7 @@ async function refresh() {
       (s.coordinator ? ` · coordinated by #${s.coordinator} ★` : '');
     startBtn.disabled = s.running;
     startBtn.textContent = s.running ? 'Scanning…' : 'Start scan';
-    // Stop is always enabled: it broadcasts a fleet-wide stop from any replica,
-    // so a stuck scan can be cleared no matter which replica you're on.
-    stopBtn.disabled = false;
+
     // Active scan banner.
     const banner = $('activeBanner');
     if (s.running) {

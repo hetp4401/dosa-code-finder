@@ -227,6 +227,8 @@ impl Node {
             self.worker.c.reset();
         }
         self.worker.active.store(true, Ordering::SeqCst);
+        // Tell everyone right away (don't wait for the 2s telemetry tick).
+        self.broadcast_prog();
     }
 
     pub fn stop_work(&self) {
@@ -457,6 +459,30 @@ impl Node {
 
     // ---- telemetry ----
 
+    /// Broadcast this replica's progress right now (for the page's replica cards).
+    fn broadcast_prog(&self) {
+        let id = self.worker.scan.lock().unwrap().to_string();
+        let tried = self.worker.c.tried.load(Ordering::Relaxed);
+        let queue = self.worker.queue.lock().unwrap().len();
+        let last_error = self.worker.c.last_error.lock().unwrap().clone();
+        let c = &self.worker.c;
+        let stats = Stats {
+            ok: c.ok_200.load(Ordering::Relaxed), e429: c.http_429.load(Ordering::Relaxed),
+            e4: c.http_4xx.load(Ordering::Relaxed), e5: c.http_5xx.load(Ordering::Relaxed),
+            net: c.net_errors.load(Ordering::Relaxed), timeouts: c.timeouts.load(Ordering::Relaxed),
+            retrying: c.retrying.load(Ordering::Relaxed), pace: (self.pacer.rate() * 10.0).round() / 10.0,
+        };
+        // Instantaneous rate isn't known here; the loop fills it in.
+        self.progs.lock().unwrap().insert(self.me, PeerProg { scan: id.clone(), tried, rate: 0.0, queue, last_error: last_error.clone(), stats: stats.clone(), at: Instant::now() });
+        self.broadcast(&Msg::Prog { id, by: self.me, tried, rate: 0.0, queue, last_error, stats });
+    }
+
+    /// Workers the leader currently has chunks assigned to (so the page shows them working immediately).
+    fn assigned_workers(&self) -> HashSet<u32> {
+        let a = self.assign.lock().unwrap();
+        a.assigned.values().map(|(w, _)| *w).collect()
+    }
+
     /// Every 2 s: this replica's progress to every replica, for the page.
     pub async fn prog_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -514,15 +540,19 @@ impl Node {
         let leader = r.leader;
         let term = r.term;
         let role = format!("{:?}", r.role).to_lowercase();
+        let am_leader = r.role == raft::Role::Leader;
         drop(r);
+        // If I'm the leader, I know exactly who has chunks right now (faster than telemetry).
+        let assigned = if am_leader && running { self.assigned_workers() } else { HashSet::new() };
         let replicas: Vec<serde_json::Value> = (1..=self.n)
             .map(|rk| {
                 let up = rk == self.me || peers.contains_key(&rk);
                 let p = progs.get(&rk).filter(|p| p.scan == sid && !sid.is_empty());
                 let fresh = p.map(|p| now.duration_since(p.at) < Duration::from_secs(6)).unwrap_or(false);
+                let busy = fresh && p.map(|p| p.queue > 0 || p.rate > 0.0).unwrap_or(false);
                 let st = if !up {
                     "offline"
-                } else if running && fresh && p.map(|p| p.queue > 0 || p.rate > 0.0).unwrap_or(false) {
+                } else if running && (busy || assigned.contains(&rk)) {
                     "working"
                 } else {
                     "idle"
