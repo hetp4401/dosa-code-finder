@@ -124,7 +124,14 @@ struct AssignState {
     /// Done reports waiting to be batched into the log.
     batch: Vec<u32>,
     batch_scan: String,
+    /// Workers allowed to hold chunks right now. Starts at 5 and grows in
+    /// batches of 5 as they saturate, so a scan ramps up instead of bursting
+    /// all replicas at checktodine.com at once.
+    activated: HashSet<u32>,
 }
+
+/// How many workers get chunks at scan start; more join in batches of this size.
+const RAMP_BATCH: usize = 5;
 
 pub struct Node {
     pub me: u32,
@@ -165,6 +172,7 @@ impl Node {
             assign: Mutex::new(AssignState {
                 scan_id: String::new(), perm: Vec::new(), assigned: HashMap::new(),
                 resting: HashMap::new(), done_pending: HashSet::new(), batch: Vec::new(), batch_scan: String::new(),
+                activated: HashSet::new(),
             }),
             fwd: Mutex::new(HashMap::new()),
             req_id: AtomicU64::new(0),
@@ -375,10 +383,15 @@ impl Node {
             };
             let mut a = self.assign.lock().unwrap();
             if a.scan_id != scan_id {
+                // New scan: start with the first RAMP_BATCH live workers.
+                let mut init: Vec<u32> = self.live();
+                init.sort_unstable();
+                init.truncate(RAMP_BATCH);
                 *a = AssignState {
                     scan_id: scan_id.clone(), perm: permutation(from, to, seed),
                     assigned: HashMap::new(), resting: HashMap::new(),
                     done_pending: HashSet::new(), batch: Vec::new(), batch_scan: String::new(),
+                    activated: init.into_iter().collect(),
                 };
             }
             let now = Instant::now();
@@ -414,6 +427,10 @@ impl Node {
             'hand: loop {
                 let mut any = false;
                 for &w in &live {
+                    // Only activated workers get chunks (ramp-up in batches).
+                    if !a.activated.contains(&w) {
+                        continue;
+                    }
                     if a.resting.contains_key(&w) || out.get(&w).copied().unwrap_or(0) >= PER_WORKER {
                         continue;
                     }
@@ -433,6 +450,20 @@ impl Node {
                 }
                 if !any {
                     break;
+                }
+            }
+            // Ramp up: if every activated worker is saturated and chunks remain,
+            // activate the next batch of live workers.
+            let saturated = a.activated.iter().all(|w| {
+                !live.contains(w) || a.resting.contains_key(w) || out.get(w).copied().unwrap_or(0) >= PER_WORKER
+            });
+            let chunks_left = (0..chunks).any(|c| !done.get(c).copied().unwrap_or(false) && !a.assigned.contains_key(&c) && !a.done_pending.contains(&c));
+            if saturated && chunks_left {
+                let mut more: Vec<u32> = live.iter().filter(|w| !a.activated.contains(w)).copied().collect();
+                more.sort_unstable();
+                for w in more.into_iter().take(RAMP_BATCH) {
+                    println!("scan {scan_id}: activating replica {w} (ramp-up)");
+                    a.activated.insert(w);
                 }
             }
             drop(a);
