@@ -219,13 +219,15 @@ impl Node {
 
     /// This replica works for scan id from now on (a new scan: queue and counters start afresh).
     pub fn join_work(&self, id: &str) {
-        let mut scan = self.worker.scan.lock().unwrap();
-        if &**scan != id {
-            *scan = Arc::from(id);
-            self.worker.queue.lock().unwrap().clear();
-            self.worker.left.lock().unwrap().clear();
-            self.worker.c.reset();
-        }
+        {
+            let mut scan = self.worker.scan.lock().unwrap();
+            if &**scan != id {
+                *scan = Arc::from(id);
+                self.worker.queue.lock().unwrap().clear();
+                self.worker.left.lock().unwrap().clear();
+                self.worker.c.reset();
+            }
+        } // release scan lock before broadcast_prog (it locks scan again)
         self.worker.active.store(true, Ordering::SeqCst);
         // Tell everyone right away (don't wait for the 2s telemetry tick).
         self.broadcast_prog();

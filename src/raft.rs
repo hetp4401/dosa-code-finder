@@ -803,8 +803,15 @@ impl Node {
                     _ => {
                         if now >= r.election_at {
                             let me = self.me;
+                            let n = self.n;
                             r.become_candidate(me);
-                            Act::Elect
+                            // Single node (or already have quorum): become leader immediately.
+                            if r.votes.len() >= Raft::quorum(n) {
+                                r.become_leader(me, n);
+                                Act::Beat
+                            } else {
+                                Act::Elect
+                            }
                         } else {
                             Act::None
                         }
