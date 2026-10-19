@@ -21,6 +21,13 @@ every *j > i*, pings every 20 s, reconnects on its own). Over it (`src/coord.rs`
 - **All replicas at once, in a random order.** The replica it was started on coordinates: the range is shuffled (a
   permutation from the scan's seed), cut into chunks of 250, and every connected replica gets 2 chunks straight away and
   another each time it finishes one. A chunk not done in 3 minutes goes elsewhere and that replica rests 3 minutes.
+- **Every code until it's answered.** An error (429, 5xx, a timeout, a dropped connection) is tried again, for as long
+  as it takes: the wait doubles each time up to 10 minutes, at a random point between half of that and all of it (so
+  replicas don't come back in step). A code counts, and its chunk is done, only once the site has answered it, so
+  "no code found" means every code was answered. A chunk not done in 90 s is also handed to another replica (another
+  IP usually gets through); whichever answers first, the other lets it go.
+- **Each replica sets its own pace**, 100/s at most: a second with over 20% errors cuts it by 30%, one under 5% adds
+  5/s back. The cards show each replica's answers, its errors by kind, its pace and the codes it's retrying.
 - **Stop from anywhere.** Stop on any replica reaches every replica over the mesh, and over HTTP too (`/stop?local=1`).
   A code found anywhere stops every replica.
 - **A coordinator that goes** (its machine leaves, say) is taken over after 20 s by the lowest replica connected, by the

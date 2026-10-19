@@ -15,10 +15,7 @@
 //!   - The last scan (for the cooldown) and the codes found are passed on to every replica that connects, so they
 //!     last as long as any replica is up.
 
-use crate::{submit, Counters};
-use governor::clock::DefaultClock;
-use governor::state::{InMemoryState, NotKeyed};
-use governor::RateLimiter;
+use crate::{submit, Counters, Pacer};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::RandomState;
@@ -34,7 +31,7 @@ pub const CHUNK: u32 = 250;
 /// Chunks a replica holds at a time: the next one is queued while it works on one.
 const PER_WORKER: usize = 2;
 /// A chunk not done this long after it was handed out goes to another replica.
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(180);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
 /// And the replica that was slow gets nothing for this long (the site may be throttling it).
 const REST: Duration = Duration::from_secs(180);
 /// A coordinator not heard from this long is taken over.
@@ -180,7 +177,7 @@ pub enum Msg {
     /// Codes for one replica.
     Assign { id: String, epoch: u32, chunk: u32, codes: Vec<String> },
     /// A replica's progress, every 2 s while it works.
-    Prog { id: String, by: u32, tried: u64, rate: f64, queue: usize, last_error: String },
+    Prog { id: String, by: u32, tried: u64, rate: f64, queue: usize, last_error: String, #[serde(default)] stats: Stats },
     Done { id: String, chunk: u32, by: u32 },
     Found { id: String, code: String, by: u32 },
     Stop { id: Option<String>, by: u32 },
@@ -211,7 +208,21 @@ pub struct Coord {
     last_hb: Instant,
 }
 
+/// A replica's answers and errors (since its scan began), how many codes wait for another try, and its pace.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Stats {
+    pub ok: u64,
+    pub e429: u64,
+    pub e4: u64,
+    pub e5: u64,
+    pub net: u64,
+    pub timeouts: u64,
+    pub retrying: u64,
+    pub pace: f64,
+}
+
 pub struct PeerProg {
+    pub stats: Stats,
     pub scan: String,
     pub tried: u64,
     pub rate: f64,
@@ -255,7 +266,7 @@ pub struct Node {
     pub boot: String,
     pub n: u32,
     pub client: Client,
-    pub limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    pub pacer: Arc<Pacer>,
     pub peers: Mutex<HashMap<u32, Peer>>,
     pub core: Mutex<Core>,
     replies: Mutex<HashMap<String, mpsc::UnboundedSender<(u32, bool, String, String)>>>,
@@ -276,13 +287,13 @@ fn merge_done(done: &mut [bool], text: &str) {
 }
 
 impl Node {
-    pub fn new(me: u32, n: u32, client: Client, limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>) -> Arc<Node> {
+    pub fn new(me: u32, n: u32, client: Client, pacer: Arc<Pacer>) -> Arc<Node> {
         Arc::new(Node {
             me,
             boot: format!("{:012x}", random_u64() & 0xffff_ffff_ffff),
             n,
             client,
-            limiter,
+            pacer,
             peers: Mutex::new(HashMap::new()),
             core: Mutex::new(Core::default()),
             replies: Mutex::new(HashMap::new()),
@@ -379,8 +390,8 @@ impl Node {
                     self.take_codes(&id, chunk as usize, codes);
                 }
             }
-            Msg::Prog { id, by, tried, rate, queue, last_error } => {
-                self.core.lock().unwrap().progs.insert(by, PeerProg { scan: id, tried, rate, queue, last_error, at: Instant::now() });
+            Msg::Prog { id, by, tried, rate, queue, last_error, stats } => {
+                self.core.lock().unwrap().progs.insert(by, PeerProg { scan: id, tried, rate, queue, last_error, stats, at: Instant::now() });
             }
             Msg::Done { id, chunk, .. } => self.note_done(&id, chunk as usize),
             Msg::Found { id, code, by } => self.note_found(&id, code, by, false),
@@ -709,6 +720,9 @@ impl Node {
     }
 
     fn note_done(&self, id: &str, chunk: usize) {
+        if &**self.w.scan.lock().unwrap() == id && self.w.left.lock().unwrap().remove(&chunk).is_some() {
+            self.w.queue.lock().unwrap().retain(|(_, k, _)| *k != chunk);
+        }
         let mut c = self.core.lock().unwrap();
         let Core { scan, coord, .. } = &mut *c;
         if let Some(s) = scan {
@@ -946,8 +960,14 @@ impl Node {
                 let queue = self.w.queue.lock().unwrap().len();
                 let last_error = self.w.c.last_error.lock().unwrap().clone();
                 let r = (rate * 10.0).round() / 10.0;
-                self.core.lock().unwrap().progs.insert(self.me, PeerProg { scan: id.clone(), tried, rate: r, queue, last_error: last_error.clone(), at: Instant::now() });
-                self.broadcast(&Msg::Prog { id, by: self.me, tried, rate: r, queue, last_error });
+                let c = &self.w.c;
+                let stats = Stats {
+                    ok: c.ok_200.load(Ordering::Relaxed), e429: c.http_429.load(Ordering::Relaxed), e4: c.http_4xx.load(Ordering::Relaxed),
+                    e5: c.http_5xx.load(Ordering::Relaxed), net: c.net_errors.load(Ordering::Relaxed), timeouts: c.timeouts.load(Ordering::Relaxed),
+                    retrying: c.retrying.load(Ordering::Relaxed), pace: (self.pacer.rate() * 10.0).round() / 10.0,
+                };
+                self.core.lock().unwrap().progs.insert(self.me, PeerProg { scan: id.clone(), tried, rate: r, queue, last_error: last_error.clone(), stats: stats.clone(), at: Instant::now() });
+                self.broadcast(&Msg::Prog { id, by: self.me, tried, rate: r, queue, last_error, stats });
             }
             let takeover = {
                 let c = self.core.lock().unwrap();
@@ -1004,6 +1024,7 @@ impl Node {
                     "id": r, "state": st, "coordinator": coord == Some(r) && running,
                     "tried": p.map(|p| p.tried).unwrap_or(0), "buffer_len": p.map(|p| p.queue).unwrap_or(0),
                     "rate": if fresh { p.map(|p| p.rate).unwrap_or(0.0) } else { 0.0 }, "last_error": p.map(|p| p.last_error.clone()).unwrap_or_default(),
+                    "stats": p.map(|p| p.stats.clone()).unwrap_or_default(),
                 })
             })
             .collect();
@@ -1016,7 +1037,9 @@ impl Node {
     }
 }
 
-/// Every BUFFER_WORKERS of these drain the queue through the rate limiter.
+/// Every BUFFER_WORKERS of these drain the queue, each code tried until the site answers it (see submit): a code
+/// counts as tried, and its chunk as done, only once it's answered. One is let go only when it's no longer wanted:
+/// the scan stopped or found, or its chunk answered by another replica (the coordinator hands a slow chunk out again).
 pub async fn work(node: Arc<Node>) {
     loop {
         let item = node.w.queue.lock().unwrap().pop_front();
@@ -1024,16 +1047,19 @@ pub async fn work(node: Arc<Node>) {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        node.limiter.until_ready().await;
-        if !node.w.active.load(Ordering::SeqCst) || *node.w.scan.lock().unwrap() != sid {
-            continue;
+        let keep = || {
+            node.w.active.load(Ordering::SeqCst) && *node.w.scan.lock().unwrap() == sid && node.w.left.lock().unwrap().contains_key(&chunk)
+        };
+        match submit(&node.client, &node.w.c, &node.pacer, &code, keep).await {
+            None => {}
+            Some(true) => {
+                node.w.c.tried.fetch_add(1, Ordering::Relaxed);
+                node.note_found(&sid, code, node.me, true);
+            }
+            Some(false) => {
+                node.w.c.tried.fetch_add(1, Ordering::Relaxed);
+                node.tried(&sid, chunk);
+            }
         }
-        let hit = submit(&node.client, &node.w.c, &node.w.active, &code).await;
-        node.w.c.tried.fetch_add(1, Ordering::Relaxed);
-        if hit {
-            node.note_found(&sid, code, node.me, true);
-            continue;
-        }
-        node.tried(&sid, chunk);
     }
 }

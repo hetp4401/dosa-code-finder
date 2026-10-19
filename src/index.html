@@ -102,13 +102,20 @@ function esc(s) {
 
 function repCard(r) {
   const stLabel = r.state === 'cooldown' ? 'cooldown' : r.state;
+  const st = r.stats || {}, errs = errText(st);
   return `<div class="rep">
     <span class="id">#${r.id}${r.coordinator ? ' ★' : ''}</span>
     <span class="st st-${r.state === 'working' ? 'running' : r.state}">${stLabel}</span>
-    <div class="prog">${r.tried.toLocaleString()} tried</div>
-    <div class="rate">buf ${r.buffer_len} · ${r.rate != null ? r.rate + '/s' : ''}</div>
-    ${r.last_error ? `<div class="rerr">${esc(r.last_error)}</div>` : ''}
+    <div class="prog">${r.tried.toLocaleString()} answered</div>
+    <div class="rate">${r.rate}/s · pace ${st.pace || 0}/s · queue ${r.buffer_len}</div>
+    <div class="rate">${(st.ok || 0).toLocaleString()} ok${errs ? ' · ' + errs : ''}</div>
+    ${st.retrying ? `<div class="rerr">${st.retrying} code${st.retrying === 1 ? '' : 's'} retrying${r.last_error ? ' (last: ' + esc(r.last_error) + ')' : ''}</div>` : ''}
   </div>`;
+}
+// ("12 × 429 · 3 × 5xx": a replica's errors, each retried until the site answers)
+function errText(st) {
+  return [[st.e429, '429'], [st.e5, '5xx'], [st.e4, '4xx'], [st.timeouts, 'timeouts'], [st.net, 'conn']]
+    .filter(([n]) => n).map(([n, k]) => `${n.toLocaleString()} ${k}`).join(' · ');
 }
 
 async function refresh() {
