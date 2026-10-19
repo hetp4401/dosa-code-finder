@@ -165,7 +165,7 @@ impl Pacer {
 /// point between half of that and all of it (full jitter's gentler cousin), so replicas that failed together don't
 /// come back together.
 const FIRST_BACKOFF: Duration = Duration::from_millis(200);
-const MAX_BACKOFF: Duration = Duration::from_secs(600);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 fn backoff(failures: u32) -> Duration {
     let base = FIRST_BACKOFF.saturating_mul(1u32 << failures.min(20)).min(MAX_BACKOFF);
