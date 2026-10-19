@@ -26,7 +26,7 @@ use governor::clock::DefaultClock;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1188,18 +1188,26 @@ async fn orch_start_handler(
     (StatusCode::OK, Json(json!({"ok": true, "message": msg})))
 }
 
-/// GET /orchestrate/stop — stops the orchestrator and all workers.
-/// Also stops the local worker role if it's running.
-async fn orch_stop_handler(State(state): State<AppState>) -> impl IntoResponse {
+/// GET /orchestrate/stop — stops the orchestrator and all workers, from ANY replica.
+///
+/// Pressing Stop on any replica now clears the whole fleet: it fans out a
+/// stop to every replica's worker role AND orchestrator role, even if this
+/// replica itself is idle. The fan-out carries ?local=1 so receiving replicas
+/// stop locally without re-broadcasting (no broadcast storm). Idempotent:
+/// replicas with nothing running just no-op.
+async fn orch_stop_handler(
+    State(state): State<AppState>,
+    query: Result<Query<HashMap<String, String>>, QueryRejection>,
+) -> impl IntoResponse {
+    let local_only = query
+        .as_ref()
+        .ok()
+        .and_then(|Query(q)| q.get("local"))
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
     let was_orchestrating = state.orch_running.swap(false, Ordering::SeqCst);
     let was_working = state.is_running.load(Ordering::SeqCst);
-
-    if !was_orchestrating && !was_working {
-        return (
-            StatusCode::OK,
-            Json(json!({"ok": true, "message": "nothing running"})),
-        );
-    }
 
     if was_orchestrating {
         *state.orch_message.lock().await = "stopped by user".to_string();
@@ -1209,22 +1217,38 @@ async fn orch_stop_handler(State(state): State<AppState>) -> impl IntoResponse {
         state.stop_requested.store(true, Ordering::SeqCst);
     }
 
-    // Stop all worker replicas (if orchestrating).
-    let urls: Vec<String> = {
-        let reps = state.orch_replicas.lock().await;
-        reps.iter().map(|r| r.url.clone()).collect()
-    };
-    let client = state.client.clone();
-    tokio::spawn(async move {
-        for url in urls {
-            let c = client.clone();
-            let _ = c.get(format!("{url}/stop")).send().await;
-        }
-    });
+    if !local_only {
+        // Fan out to EVERY replica: stop workers and any orchestrator, anywhere.
+        let n = replica_count();
+        let client = state.client.clone();
+        tokio::spawn(async move {
+            let stops = (1..=n).flat_map(|id| {
+                let base = replica_url(id);
+                vec![
+                    format!("{base}/stop"),
+                    format!("{base}/orchestrate/stop?local=1"),
+                ]
+            });
+            let _ = stream::iter(stops)
+                .map(|url| {
+                    let c = client.clone();
+                    async move {
+                        let _ = c
+                            .get(&url)
+                            .timeout(Duration::from_secs(5))
+                            .send()
+                            .await;
+                    }
+                })
+                .buffer_unordered(20)
+                .collect::<Vec<_>>()
+                .await;
+        });
+    }
 
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "message": "stop requested (orchestrator and worker)"})),
+        Json(json!({"ok": true, "message": "stop broadcast to all replicas"})),
     )
 }
 

@@ -144,7 +144,9 @@ async function refresh() {
     $('grid').innerHTML = (s.replicas || []).map(repCard).join('');
     startBtn.disabled = s.running;
     startBtn.textContent = s.running ? 'Scanning…' : 'Start scan';
-    stopBtn.disabled = !s.running;
+    // Stop is always enabled: it broadcasts a fleet-wide stop from any replica,
+    // so a stuck scan can be cleared no matter which replica you're on.
+    stopBtn.disabled = false;
     // Active scan banner.
     const banner = $('activeBanner');
     if (s.running) {
