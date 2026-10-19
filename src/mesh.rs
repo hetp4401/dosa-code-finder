@@ -4,7 +4,8 @@
 //! silent for 100 s), and one that hears nothing for SILENT is closed. A dial that fails is tried again, 1 s after
 //! the first failure up to 30 s apart.
 
-use crate::coord::{Msg, Node};
+use crate::coord::Node;
+use crate::raft::Msg;
 use crate::replica_url;
 use axum::extract::ws::{Message as AxMsg, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -128,7 +129,7 @@ where
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let serial = node.register(id, boot, tx);
-    node.handle(id, first);
+    node.on_msg(id, first);
     let writer = async {
         let mut ping = tokio::time::interval(PING);
         ping.tick().await;
@@ -147,7 +148,7 @@ where
         loop {
             match tokio::time::timeout(SILENT, stream.next()).await {
                 Ok(Some(Ok(Frame::Text(t)))) => match serde_json::from_str::<Msg>(&t) {
-                    Ok(m) => node.handle(id, m),
+                    Ok(m) => node.on_msg(id, m),
                     Err(e) => println!("mesh: replica {id} sent something unreadable: {e}"),
                 },
                 Ok(Some(Ok(Frame::Other))) | Ok(Some(Ok(Frame::Ping))) => {}
