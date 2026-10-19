@@ -174,6 +174,25 @@ fn backoff(failures: u32) -> Duration {
 /// again after backoff(n), for as long as it takes; None only once keep() says it's no longer wanted (the scan
 /// stopped or found, or its chunk answered elsewhere). Every outcome is counted.
 pub async fn submit(client: &Client, c: &Counters, pacer: &Pacer, code: &str, keep: impl Fn() -> bool) -> Option<bool> {
+    // DRY RUN mode: mock all HTTP as successful responses without hitting the real site.
+    // Set DRY_RUN=1 to enable. Set DRY_RUN_FOUND=<code> to mock that code as valid (tests Found flow).
+    // Set DRY_RUN_DELAY_MS=<ms> to simulate network latency per request (default 5).
+    if std::env::var("DRY_RUN").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        if !keep() { return None; }
+        let delay_ms: u64 = std::env::var("DRY_RUN_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if !keep() { return None; }
+        c.ok_200.fetch_add(1, Ordering::Relaxed);
+        pacer.answered();
+        *c.trial_code.lock().unwrap() = code.to_string();
+        let found_code = std::env::var("DRY_RUN_FOUND").ok().filter(|v| !v.is_empty());
+        let success = found_code.as_deref() == Some(code);
+        if success {
+            *c.valid_code.lock().unwrap() = code.to_string();
+            println!("DRY RUN: mock found valid code: {code}");
+        }
+        return Some(success);
+    }
     let form = [
         ("RestaurantCode", code),
         ("WaitListName", "Hari"),
@@ -315,6 +334,7 @@ async fn status_handler(State(node): State<Arc<Node>>) -> impl IntoResponse {
         "buffer_len": node.worker.queue.lock().unwrap().len(), "replica": node.me,
         "leader": leader, "term": term, "role": role,
         "connected": node.peers.lock().unwrap().len() + 1,
+        "dry_run": std::env::var("DRY_RUN").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false),
     }))
 }
 

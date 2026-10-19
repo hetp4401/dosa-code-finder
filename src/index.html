@@ -128,11 +128,12 @@ async function refresh() {
     const r = await fetch('/orchestrate/status');
     if (!r.ok) return;
     const s = await r.json();
-    const stateLabel = s.running ? 'Running' :
+    const dryTag = s.dry_run ? ' 🧪 DRY RUN' : '';
+    const stateLabel = (s.running ? 'Running' :
       (s.state === 'done' && s.found ? 'Done — found!' :
        s.state === 'done' ? 'Done' :
        s.state === 'failed' ? 'Failed' :
-       s.state === 'stopped' ? 'Stopped' : 'Idle');
+       s.state === 'stopped' ? 'Stopped' : 'Idle')) + dryTag;
     $('state').textContent = stateLabel;
     $('range').textContent = s.range || '—';
     const pct = s.total > 0 ? Math.min(100, Math.floor(100 * s.tried / s.total)) : 0;
