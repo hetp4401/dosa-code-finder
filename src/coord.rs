@@ -577,6 +577,12 @@ impl Node {
         drop(r);
         // If I'm the leader, I know exactly who has chunks right now (faster than telemetry).
         let assigned = if am_leader && running { self.assigned_workers() } else { HashSet::new() };
+        // Codes handed to workers but not yet answered (fresh telemetry queues), and the codes not
+        // handed out to anyone yet. The page shows `queued`; it used to go missing and break the UI.
+        let in_queues: u64 = progs.values()
+            .filter(|p| p.scan == sid && !sid.is_empty() && now.duration_since(p.at) < Duration::from_secs(6))
+            .map(|p| p.queue as u64).sum();
+        let queued = if running { total.saturating_sub(tried).saturating_sub(in_queues) } else { 0 };
         let replicas: Vec<serde_json::Value> = (1..=self.n)
             .map(|rk| {
                 let up = rk == self.me || peers.contains_key(&rk);
@@ -601,7 +607,7 @@ impl Node {
             .collect();
         serde_json::json!({
             "running": running, "state": state, "found": found, "valid_code": valid, "message": message,
-            "range": range, "tried": tried, "total": total,
+            "range": range, "tried": tried, "total": total, "queued": queued,
             "leader": leader, "term": term, "role": role, "me": self.me,
             "replica_count": self.n, "connected": peers.len() + 1, "quorum": self.quorum(),
             "history": sm.history, "last": sm.last, "replicas": replicas,

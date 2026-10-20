@@ -10,8 +10,8 @@ mod mesh;
 mod raft;
 
 use axum::extract::{rejection::QueryRejection, Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Json};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use coord::Node;
@@ -304,7 +304,7 @@ async fn stop_handler(State(node): State<Arc<Node>>, Query(q): Query<HashMap<Str
 }
 
 /// GET /status — this replica's own work.
-async fn status_handler(State(node): State<Arc<Node>>) -> impl IntoResponse {
+async fn status_handler(State(node): State<Arc<Node>>) -> Response {
     let c = &node.worker.c;
     let (range, total, tried) = {
         let sm = node.sm.lock().unwrap();
@@ -324,7 +324,7 @@ async fn status_handler(State(node): State<Arc<Node>>) -> impl IntoResponse {
     let r = node.raft.lock().unwrap();
     let (leader, term, role) = (r.leader, r.term, format!("{:?}", r.role).to_lowercase());
     drop(r);
-    Json(json!({
+    let mut body = Json(json!({
         "running": node.worker.active.load(Ordering::SeqCst), "range": range, "tried": tried, "total": total,
         "trial_code": c.trial_code.lock().unwrap().clone(), "valid_code": c.valid_code.lock().unwrap().clone(),
         "found": *c.valid_code.lock().unwrap() != "—",
@@ -335,16 +335,54 @@ async fn status_handler(State(node): State<Arc<Node>>) -> impl IntoResponse {
         "leader": leader, "term": term, "role": role,
         "connected": node.peers.lock().unwrap().len() + 1,
         "dry_run": std::env::var("DRY_RUN").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false),
-    }))
+    })).into_response();
+    *body.headers_mut() = no_store_headers();
+    body
 }
 
-/// GET /orchestrate/status — the scan, as the Raft log has it.
-async fn orch_status_handler(State(node): State<Arc<Node>>) -> impl IntoResponse {
-    Json(node.status())
+/// No-store headers: nothing on this app is cached, ever. The UI must always show the live scan,
+/// never yesterday's HTML or a stale JSON body.
+fn no_store_headers() -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate"));
+    h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    h
 }
 
-async fn root_handler() -> Html<&'static str> {
-    Html(include_str!("index.html"))
+/// GET /orchestrate/status — the scan, as the LEADER sees it. Per-replica telemetry converges on the leader
+/// (workers report there), so a follower's local view is partial: it reliably knows only itself. Followers
+/// therefore proxy this endpoint to the leader over HTTP (2s timeout) and serve the leader's answer verbatim,
+/// so every replica's page shows the same authoritative data. ?via=1 marks a proxied request: answer locally,
+/// never re-proxy (avoids loops when Raft leader info is momentarily stale).
+async fn orch_status_handler(State(node): State<Arc<Node>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let via = q.get("via").map(|v| v == "1").unwrap_or(false);
+    let (is_leader, leader) = {
+        let r = node.raft.lock().unwrap();
+        (r.role == raft::Role::Leader, r.leader)
+    };
+    if !via && !is_leader {
+        if let Some(l) = leader.filter(|&l| l != node.me && l >= 1 && l <= node.n) {
+            let url = format!("{}/orchestrate/status?via=1", replica_url(l));
+            if let Ok(resp) = node.client.get(&url).timeout(Duration::from_secs(2)).send().await {
+                if resp.status().is_success() {
+                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                        let mut body = Json(v).into_response();
+                        *body.headers_mut() = no_store_headers();
+                        return body;
+                    }
+                }
+            }
+        }
+    }
+    let mut body = Json(node.status()).into_response();
+    *body.headers_mut() = no_store_headers();
+    body
+}
+
+async fn root_handler() -> Response {
+    let mut body = Html(include_str!("index.html")).into_response();
+    *body.headers_mut() = no_store_headers();
+    body
 }
 
 /// Drains this replica's queue: every code tried until the site answers it. A hit is reported until the log

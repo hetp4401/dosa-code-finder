@@ -107,7 +107,7 @@ function repCard(r) {
     const st = r.stats || {}, errs = errText(st);
     const tried = (r.tried || 0).toLocaleString();
     return `<div class="rep">
-      <span class="id">#${r.id || '?'}${r.coordinator ? ' ★' : ''}</span>
+      <span class="id">#${r.id || '?'}${r.leader ? ' ★' : ''}</span>
       <span class="st st-${r.state === 'working' ? 'running' : (r.state || 'unknown')}">${esc(stLabel)}</span>
       <div class="prog">${tried} answered</div>
       <div class="rate">${r.rate || 0}/s · pace ${st.pace || 0}/s · queue ${r.buffer_len || 0}</div>
@@ -130,7 +130,7 @@ async function refresh() {
   // Stop is always clickable, even if this poll fails.
   stopBtn.disabled = false;
   try {
-    const r = await fetch('/orchestrate/status');
+    const r = await fetch('/orchestrate/status?_=' + Date.now(), { cache: 'no-store' });
     if (!r.ok) return;
     const s = await r.json();
     const dryTag = s.dry_run ? ' 🧪 DRY RUN' : '';
@@ -150,7 +150,7 @@ async function refresh() {
     validEl.textContent = s.valid_code || '—';
     validEl.classList.toggle('found', !!s.found);
     $('msg').textContent = s.message || '—';
-    $('queued').textContent = s.running ? s.queued.toLocaleString() + ' codes not handed out yet' : '—';
+    $('queued').textContent = s.running ? (s.queued || 0).toLocaleString() + ' codes not handed out yet' : '—';
     // History.
     const hist = s.history || [];
     $('history').innerHTML = hist.length
@@ -160,7 +160,7 @@ async function refresh() {
       : '—';
     $('grid').innerHTML = (s.replicas || []).map(repCard).join('');
     $('mesh').textContent = `${s.connected} of ${s.replica_count} connected (this is #${s.me}; a scan needs ${s.quorum})` +
-      (s.coordinator ? ` · coordinated by #${s.coordinator} ★` : '');
+      (s.leader ? ` · led by #${s.leader} ★` : '');
     startBtn.disabled = s.running;
     startBtn.textContent = s.running ? 'Scanning…' : 'Start scan';
 
