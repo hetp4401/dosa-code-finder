@@ -102,16 +102,21 @@ function esc(s) {
 }
 
 function repCard(r) {
-  const stLabel = r.state === 'cooldown' ? 'cooldown' : r.state;
-  const st = r.stats || {}, errs = errText(st);
-  return `<div class="rep">
-    <span class="id">#${r.id}${r.coordinator ? ' ★' : ''}</span>
-    <span class="st st-${r.state === 'working' ? 'running' : r.state}">${stLabel}</span>
-    <div class="prog">${r.tried.toLocaleString()} answered</div>
-    <div class="rate">${r.rate}/s · pace ${st.pace || 0}/s · queue ${r.buffer_len}</div>
-    <div class="rate">${(st.ok || 0).toLocaleString()} ok${errs ? ' · ' + errs : ''}</div>
-    ${st.retrying ? `<div class="rerr">${st.retrying} code${st.retrying === 1 ? '' : 's'} retrying${r.last_error ? ' (last: ' + esc(r.last_error) + ')' : ''}</div>` : ''}
-  </div>`;
+  try {
+    const stLabel = r.state === 'cooldown' ? 'cooldown' : (r.state || 'unknown');
+    const st = r.stats || {}, errs = errText(st);
+    const tried = (r.tried || 0).toLocaleString();
+    return `<div class="rep">
+      <span class="id">#${r.id || '?'}${r.coordinator ? ' ★' : ''}</span>
+      <span class="st st-${r.state === 'working' ? 'running' : (r.state || 'unknown')}">${esc(stLabel)}</span>
+      <div class="prog">${tried} answered</div>
+      <div class="rate">${r.rate || 0}/s · pace ${st.pace || 0}/s · queue ${r.buffer_len || 0}</div>
+      <div class="rate">${(st.ok || 0).toLocaleString()} ok${errs ? ' · ' + errs : ''}</div>
+      ${st.retrying ? `<div class="rerr">${st.retrying} code${st.retrying === 1 ? '' : 's'} retrying${r.last_error ? ' (last: ' + esc(r.last_error) + ')' : ''}</div>` : ''}
+    </div>`;
+  } catch (e) {
+    return `<div class="rep"><span class="id">#${r && r.id || '?'}</span><span class="st">error</span></div>`;
+  }
 }
 // ("12 × 429 · 3 × 5xx": a replica's errors, each retried until the site answers)
 function errText(st) {
@@ -180,6 +185,7 @@ startBtn.addEventListener('click', async () => {
   $('from').value = from; $('to').value = to;
   if (from >= to) { errEl.textContent = 'Need From < To (To is exclusive).'; return; }
   startBtn.disabled = true;
+  startBtn.textContent = 'Scanning…';
   let started = false;
   try {
     const r = await fetch(`/orchestrate/start?from=${from}&to=${to}`);
@@ -192,7 +198,10 @@ startBtn.addEventListener('click', async () => {
       started = true;
     }
   } catch (e) { errEl.textContent = 'Could not reach server.'; }
-  if (!started) startBtn.disabled = false;
+  if (!started) {
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start scan';
+  }
   refresh();
 });
 
