@@ -44,7 +44,6 @@
   .st-offline { color: #8a7a66; }
   .rep .seg { opacity: .75; margin: 4px 0; }
   .rep .prog { font-family: ui-monospace, monospace; }
-  .rep .rerr { color: #ff9a9a; font-size: .75rem; word-break: break-word; margin-top: 4px; }
   .rep .rate { opacity: .6; font-size: .75rem; font-family: ui-monospace, monospace; }
 </style>
 </head>
@@ -111,8 +110,7 @@ function repCard(r) {
       <span class="st st-${r.state === 'working' ? 'running' : (r.state || 'unknown')}">${esc(stLabel)}</span>
       <div class="prog">${tried} answered</div>
       <div class="rate">${r.rate || 0}/s · pace ${st.pace || 0}/s · queue ${r.buffer_len || 0}</div>
-      <div class="rate">${(st.ok || 0).toLocaleString()} ok${errs ? ' · ' + errs : ''}</div>
-      ${st.retrying ? `<div class="rerr">${st.retrying} code${st.retrying === 1 ? '' : 's'} retrying${r.last_error ? ' (last: ' + esc(r.last_error) + ')' : ''}</div>` : ''}
+      <div class="rate">${(st.ok || 0).toLocaleString()} ok${errs ? ' · ' + errs : ''}${st.retrying ? ' · ' + st.retrying + ' retrying' : ''}</div>
     </div>`;
   } catch (e) {
     return `<div class="rep"><span class="id">#${r && r.id || '?'}</span><span class="st">error</span></div>`;
