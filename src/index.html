@@ -104,6 +104,23 @@
   .st-working { color: #ffb340; }
   .st-cooldown { color: #c9a0ff; }
   .st-offline { color: #69707c; }
+  /* Phone: 3 cards per row, compact type so the labeled rows still fit. */
+  @media (max-width: 640px) {
+    body { padding: 20px 10px 40px; }
+    .card { padding: 14px; }
+    .grid { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .rep { padding: 9px; border-radius: 12px; }
+    .rep .id { font-size: .8rem; }
+    .rep .st { font-size: .58rem; letter-spacing: .03em; }
+    .rep .st-running::before { width: 5px; height: 5px; margin-right: 4px; }
+    .rep .big { font-size: 1.08rem; margin: 6px 0 1px; }
+    .rep .big .unit { display: block; font-size: .6rem; margin-top: 1px; }
+    .rep .rows { gap: 3px; margin-top: 6px; padding-top: 6px; }
+    .rep .kv { font-size: .64rem; }
+    .rep .kv .lab { white-space: nowrap; }
+    .facts { gap: 10px 12px; }
+    .pctbig { font-size: 1.5rem; }
+  }
 </style>
 </head>
 <body>
@@ -183,11 +200,11 @@ function repCard(r) {
       <div class="head"><span class="id">#${r.id || '?'}${r.leader ? ' ★' : ''}</span><span class="st st-${r.state === 'working' ? 'running' : (r.state || 'unknown')}">${esc(r.state || 'unknown')}</span></div>
       <div class="big">${(r.tried || 0).toLocaleString()} <span class="unit">codes answered</span></div>
       <div class="rows">
-        ${kv('Speed now', `${f1(r.rate)}/s`)}
-        ${kv('Speed limit', `${f1(st.pace)}/s`)}
-        ${kv('Waiting to try', (r.buffer_len || 0).toLocaleString())}
-        ${errs.length ? kv('Site pushback', errs.join(' · ')) : ''}
-        ${st.retrying ? kv('Being retried', st.retrying.toLocaleString()) : ''}
+        ${kv('Speed', `${f1(r.rate)}/s`)}
+        ${kv('Limit', `${f1(st.pace)}/s`)}
+        ${kv('Waiting', (r.buffer_len || 0).toLocaleString())}
+        ${errs.length ? kv('Pushback', errs.join(' · ')) : ''}
+        ${st.retrying ? kv('Retrying', st.retrying.toLocaleString()) : ''}
       </div>
     </div>`;
   } catch (e) {
