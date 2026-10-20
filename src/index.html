@@ -4,51 +4,106 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dosa</title>
-<!-- v30ui -->
+<!-- v31ui -->
 <style>
   :root { color-scheme: dark; }
-  body { font-family: system-ui, -apple-system, sans-serif; background: #14100b; color: #f5ead9; max-width: 900px; margin: 40px auto; padding: 0 16px; }
-  h1 { font-size: 1.4rem; }
-  .card { background: #1f1811; border: 1px solid #3a2d1c; border-radius: 12px; padding: 16px; margin: 12px 0; }
-  #activeBanner { display: none; background: #2a1f0e; border: 2px solid #e8912d; border-radius: 12px; padding: 16px; margin: 12px 0; }
-  #activeBanner.show { display: block; }
-  #activeBanner .banner-title { font-weight: 700; color: #e8912d; margin-bottom: 8px; }
-  #activeBanner button { width: auto; padding: 10px 24px; margin-top: 8px; }
-  label { display: block; font-size: .85rem; opacity: .8; margin: 8px 0 4px; }
-  input { width: 100%; box-sizing: border-box; padding: 10px; font-size: 1rem; border-radius: 8px; border: 1px solid #3a2d1c; background: #14100b; color: inherit; }
+  * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif; color: #e9edf3; max-width: 940px;
+    margin: 0 auto; padding: 28px 16px 48px;
+    background:
+      radial-gradient(720px 340px at 50% -120px, rgba(245, 165, 36, .14), transparent 70%),
+      radial-gradient(900px 500px at 85% -200px, rgba(64, 110, 255, .08), transparent 70%),
+      #06080b;
+    min-height: 100vh;
+  }
+  h1 { font-size: 1.5rem; letter-spacing: .01em; margin: 4px 0 14px; }
+  .card {
+    background: linear-gradient(180deg, #12151d, #0c0f15);
+    border: 1px solid #202836; border-radius: 16px; padding: 18px;
+    margin: 14px 0; box-shadow: 0 10px 30px rgba(0, 0, 0, .35);
+  }
+  #activeBanner {
+    display: none; position: sticky; top: 10px; z-index: 10;
+    background: linear-gradient(180deg, rgba(46, 32, 10, .92), rgba(30, 21, 8, .92));
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(245, 165, 36, .55); border-radius: 16px; padding: 16px 18px; margin: 14px 0;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
+  }
+  #activeBanner.show { display: block; animation: drop .35s cubic-bezier(.2, .9, .3, 1.2); }
+  @keyframes drop { from { opacity: 0; transform: translateY(-10px) scale(.98); } to { opacity: 1; transform: none; } }
+  #activeBanner .banner-title { font-weight: 700; color: #ffb340; margin-bottom: 6px; }
+  #activeBanner button { width: auto; padding: 10px 26px; margin-top: 10px; }
+  label { display: block; font-size: .82rem; opacity: .75; margin: 8px 0 5px; }
+  input {
+    width: 100%; padding: 12px; font-size: 1rem; border-radius: 10px;
+    border: 1px solid #232c3a; background: #090c11; color: inherit; outline: none;
+    transition: border-color .2s, box-shadow .2s;
+  }
+  input:focus { border-color: #f5a524; box-shadow: 0 0 0 3px rgba(245, 165, 36, .22); }
   .row { display: flex; gap: 12px; }
   .row > div { flex: 1; }
   .btnrow { display: flex; gap: 12px; }
   .btnrow > button { flex: 1; }
-  button { width: 100%; margin-top: 12px; padding: 12px; font-size: 1rem; border: 0; border-radius: 8px; background: #e8912d; color: #1a1206; font-weight: 700; cursor: pointer; }
-  button:disabled { opacity: .4; cursor: default; }
-  button.stop { background: #a33327; color: #ffe9e4; }
-  .bar { height: 10px; background: #14100b; border-radius: 6px; overflow: hidden; margin-top: 8px; }
-  .bar > div { height: 100%; background: #e8912d; width: 0%; transition: width .3s; }
+  button {
+    width: 100%; margin-top: 14px; padding: 13px; font-size: 1rem; border: 0; border-radius: 11px;
+    background: linear-gradient(180deg, #ffb340, #ef8f14); color: #1a1206; font-weight: 700; cursor: pointer;
+    box-shadow: 0 6px 18px rgba(239, 143, 20, .25);
+    transition: transform .12s, filter .15s, opacity .2s, box-shadow .2s;
+  }
+  button:hover { filter: brightness(1.07); }
+  button:active { transform: scale(.98); }
+  button:disabled { opacity: .38; cursor: default; box-shadow: none; }
+  button.stop { background: linear-gradient(180deg, #c9452f, #9c2b1a); color: #ffe9e4; box-shadow: 0 6px 18px rgba(201, 69, 47, .22); }
+  .statushead { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .statebig { font-size: 1.35rem; font-weight: 700; margin-top: 2px; }
+  .pctbig { font-size: 1.9rem; font-weight: 700; color: #ffb340; line-height: 1; }
+  .bar { height: 12px; background: #090c11; border: 1px solid #1d2531; border-radius: 8px; overflow: hidden; margin: 14px 0 8px; }
+  .bar > div { height: 100%; width: 0%; border-radius: 8px; background: linear-gradient(90deg, #ef8f14, #ffb340); transition: width .8s cubic-bezier(.25, .8, .3, 1); }
+  .bar > div.live { background-image: linear-gradient(90deg, #ef8f14, #ffc966, #ef8f14); background-size: 200% 100%; animation: flow 1.6s linear infinite; }
+  @keyframes flow { from { background-position: 0% 0; } to { background-position: 200% 0; } }
+  .facts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; margin-top: 14px; }
   .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
-  .found { color: #7ddf8a; font-weight: 700; }
+  .found { color: #7ddf8a !important; font-weight: 700; }
   .err { color: #ff9a9a; min-height: 1.2em; font-size: .9rem; margin-top: 8px; }
-  .k { opacity: .65; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
-  .v { font-size: 1.1rem; margin: 2px 0 10px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-top: 10px; }
-  .rep { background: #14100b; border: 1px solid #3a2d1c; border-radius: 8px; padding: 12px; font-size: .85rem; }
-  .rep .head { display: flex; justify-content: space-between; align-items: baseline; }
+  .k { opacity: .55; font-size: .74rem; text-transform: uppercase; letter-spacing: .07em; font-weight: 600; }
+  .v { font-size: 1.05rem; margin: 2px 0 10px; }
+  .fv { font-size: .98rem; margin-top: 3px; word-break: break-word; }
+  #history div { padding: 7px 0; border-bottom: 1px solid #1a212d; }
+  #history div:last-child { border-bottom: 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px; margin-top: 12px; }
+  .rep {
+    background: linear-gradient(180deg, #11141b, #0a0d12);
+    border: 1px solid #202836; border-radius: 14px; padding: 13px; font-size: .85rem;
+    transition: transform .18s, border-color .18s, box-shadow .18s;
+  }
+  @media (hover: hover) { .rep:hover { transform: translateY(-2px); border-color: #2e394c; } }
+  .rep.lead { border-color: rgba(245, 165, 36, .6); box-shadow: 0 0 0 1px rgba(245, 165, 36, .22), 0 8px 22px rgba(0, 0, 0, .4); }
+  .rep.off { opacity: .5; }
+  .rep .head { display: flex; justify-content: space-between; align-items: center; }
   .rep .id { font-weight: 700; font-size: .95rem; }
-  .rep .st { text-transform: uppercase; font-size: .72rem; letter-spacing: .06em; font-weight: 600; }
-  .rep .big { font-size: 1.4rem; font-weight: 700; margin: 8px 0 2px; font-family: ui-monospace, monospace; }
-  .rep .big .unit { font-size: .78rem; font-weight: 400; opacity: .65; }
-  .rep .rows { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c2313; display: grid; gap: 4px; }
+  .rep .st { text-transform: uppercase; font-size: .72rem; letter-spacing: .06em; font-weight: 700; }
+  .rep .st-running::before {
+    content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #ffb340; margin-right: 6px; vertical-align: 1px;
+    animation: pulse 1.3s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(255, 179, 64, .5); } 50% { opacity: .45; box-shadow: 0 0 0 5px rgba(255, 179, 64, 0); } }
+  .rep .big { font-size: 1.45rem; font-weight: 700; margin: 9px 0 2px; font-family: ui-monospace, monospace; }
+  .rep .big .unit { font-size: .76rem; font-weight: 400; opacity: .6; }
+  .rep .rows { margin-top: 9px; padding-top: 9px; border-top: 1px solid #1a212d; display: grid; gap: 5px; }
   .rep .kv { display: flex; justify-content: space-between; font-size: .8rem; }
   .rep .kv .lab { opacity: .55; }
   .rep .kv .val { font-family: ui-monospace, monospace; font-weight: 600; }
-  .st-running { color: #e8912d; }
+  .st-running { color: #ffb340; }
   .st-done { color: #7ddf8a; }
   .st-failed { color: #ff9a9a; }
   .st-pending { color: #9ab8ff; }
-  .st-idle { color: #9ab8ff; }
-  .st-working { color: #e8912d; }
+  .st-idle { color: #8fa3bd; }
+  .st-working { color: #ffb340; }
   .st-cooldown { color: #c9a0ff; }
-  .st-offline { color: #8a7a66; }
+  .st-offline { color: #69707c; }
 </style>
 </head>
 <body>
@@ -70,14 +125,23 @@
   <div class="err" id="err"></div>
 </div>
 <div class="card">
-  <div class="k">State</div><div class="v" id="state">—</div>
-  <div class="k">Replicas</div><div class="v mono" id="mesh" style="font-size:.95rem">—</div>
-  <div class="k">Range</div><div class="v mono" id="range">—</div>
-  <div class="k">Progress</div><div class="v mono" id="progress">—</div>
+  <div class="statushead">
+    <div>
+      <div class="k">State</div>
+      <div class="statebig" id="state">—</div>
+    </div>
+    <div class="pctbig mono" id="pctbig"></div>
+  </div>
   <div class="bar"><div id="barfill"></div></div>
-  <div class="k" style="margin-top:10px">Valid code</div><div class="v mono" id="valid">—</div>
-  <div class="k">Queued</div><div class="v mono" id="queued" style="font-size:.95rem">—</div>
-  <div class="k">Message</div><div class="v" id="msg" style="font-size:.95rem">—</div>
+  <div class="mono" id="progress" style="font-size:.95rem; opacity:.85">—</div>
+  <div class="facts">
+    <div><div class="k">Range</div><div class="fv mono" id="range">—</div></div>
+    <div><div class="k">Valid code</div><div class="fv mono" id="valid">—</div></div>
+    <div><div class="k">Not handed out</div><div class="fv mono" id="queued">—</div></div>
+    <div><div class="k">Replicas</div><div class="fv mono" id="mesh">—</div></div>
+  </div>
+  <div class="k" style="margin-top:14px">Message</div>
+  <div class="fv" id="msg">—</div>
 </div>
 <div class="card">
   <div class="k">Found codes history</div>
@@ -115,7 +179,7 @@ function repCard(r) {
     if (st.timeouts) errs.push(`${st.timeouts}× timeout`);
     if (st.net) errs.push(`${st.net}× conn`);
     const kv = (lab, val) => `<div class="kv"><span class="lab">${lab}</span><span class="val">${val}</span></div>`;
-    return `<div class="rep">
+    return `<div class="rep${r.leader ? ' lead' : ''}${r.state === 'offline' ? ' off' : ''}">
       <div class="head"><span class="id">#${r.id || '?'}${r.leader ? ' ★' : ''}</span><span class="st st-${r.state === 'working' ? 'running' : (r.state || 'unknown')}">${esc(r.state || 'unknown')}</span></div>
       <div class="big">${(r.tried || 0).toLocaleString()} <span class="unit">codes answered</span></div>
       <div class="rows">
@@ -153,11 +217,13 @@ async function refresh() {
       ? `${s.tried.toLocaleString()} / ${s.total.toLocaleString()} (${pct}%)`
       : '—';
     $('barfill').style.width = pct + '%';
+    $('barfill').classList.toggle('live', !!s.running);
+    $('pctbig').textContent = s.total > 0 ? pct + '%' : '';
     const validEl = $('valid');
     validEl.textContent = s.valid_code || '—';
     validEl.classList.toggle('found', !!s.found);
     $('msg').textContent = s.message || '—';
-    $('queued').textContent = s.running ? (s.queued || 0).toLocaleString() + ' codes not handed out yet' : '—';
+    $('queued').textContent = s.running ? (s.queued || 0).toLocaleString() + ' codes' : '—';
     // History.
     const hist = s.history || [];
     $('history').innerHTML = hist.length
