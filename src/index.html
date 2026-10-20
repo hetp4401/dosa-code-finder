@@ -103,6 +103,9 @@
   .rep .kv { display: flex; justify-content: space-between; font-size: .8rem; }
   .rep .kv .lab { opacity: .55; }
   .rep .kv .val { font-family: ui-monospace, monospace; font-weight: 600; }
+  .rep .kv.stack { flex-direction: column; gap: 3px; }
+  .rep .kv .segs { display: flex; flex-wrap: wrap; gap: 2px 9px; }
+  .rep .kv .seg { white-space: nowrap; }
   .st-running { color: #ffb340; }
   .st-done { color: #7ddf8a; }
   .st-failed { color: #ff9a9a; }
@@ -211,7 +214,7 @@ function repCard(r) {
         ${kv('Speed', `${f1(r.rate)}/s`)}
         ${kv('Limit', `${f1(st.pace)}/s`)}
         ${kv('Waiting', (r.buffer_len || 0).toLocaleString())}
-        ${errs.length ? kv('Pushback', errs.join(' · ')) : ''}
+        ${errs.length ? `<div class="kv stack"><span class="lab">Pushback</span><span class="val segs">${errs.map(e => `<span class="seg">${e}</span>`).join('')}</span></div>` : ''}
         ${st.retrying ? kv('Retrying', st.retrying.toLocaleString()) : ''}
       </div>
     </div>`;
