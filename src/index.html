@@ -31,9 +31,16 @@
   .k { opacity: .65; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
   .v { font-size: 1.1rem; margin: 2px 0 10px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-top: 10px; }
-  .rep { background: #14100b; border: 1px solid #3a2d1c; border-radius: 8px; padding: 10px; font-size: .85rem; }
-  .rep .id { font-weight: 700; }
-  .rep .st { float: right; text-transform: uppercase; font-size: .7rem; letter-spacing: .05em; }
+  .rep { background: #14100b; border: 1px solid #3a2d1c; border-radius: 8px; padding: 12px; font-size: .85rem; }
+  .rep .head { display: flex; justify-content: space-between; align-items: baseline; }
+  .rep .id { font-weight: 700; font-size: .95rem; }
+  .rep .st { text-transform: uppercase; font-size: .72rem; letter-spacing: .06em; font-weight: 600; }
+  .rep .big { font-size: 1.4rem; font-weight: 700; margin: 8px 0 2px; font-family: ui-monospace, monospace; }
+  .rep .big .unit { font-size: .78rem; font-weight: 400; opacity: .65; }
+  .rep .rows { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c2313; display: grid; gap: 4px; }
+  .rep .kv { display: flex; justify-content: space-between; font-size: .8rem; }
+  .rep .kv .lab { opacity: .55; }
+  .rep .kv .val { font-family: ui-monospace, monospace; font-weight: 600; }
   .st-running { color: #e8912d; }
   .st-done { color: #7ddf8a; }
   .st-failed { color: #ff9a9a; }
@@ -42,9 +49,6 @@
   .st-working { color: #e8912d; }
   .st-cooldown { color: #c9a0ff; }
   .st-offline { color: #8a7a66; }
-  .rep .seg { opacity: .75; margin: 4px 0; }
-  .rep .prog { font-family: ui-monospace, monospace; }
-  .rep .rate { opacity: .6; font-size: .75rem; font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -102,24 +106,29 @@ function esc(s) {
 
 function repCard(r) {
   try {
-    const stLabel = r.state === 'cooldown' ? 'cooldown' : (r.state || 'unknown');
-    const st = r.stats || {}, errs = errText(st);
-    const tried = (r.tried || 0).toLocaleString();
+    const st = r.stats || {};
+    const f1 = (x) => Math.round((x || 0) * 10) / 10; // one decimal
+    const errs = [];
+    if (st.e429) errs.push(`${st.e429}× 429`);
+    if (st.e5) errs.push(`${st.e5}× 5xx`);
+    if (st.e4) errs.push(`${st.e4}× other 4xx`);
+    if (st.timeouts) errs.push(`${st.timeouts}× timeout`);
+    if (st.net) errs.push(`${st.net}× conn`);
+    const kv = (lab, val) => `<div class="kv"><span class="lab">${lab}</span><span class="val">${val}</span></div>`;
     return `<div class="rep">
-      <span class="id">#${r.id || '?'}${r.leader ? ' ★' : ''}</span>
-      <span class="st st-${r.state === 'working' ? 'running' : (r.state || 'unknown')}">${esc(stLabel)}</span>
-      <div class="prog">${tried} answered</div>
-      <div class="rate">${r.rate || 0}/s · pace ${st.pace || 0}/s · queue ${r.buffer_len || 0}</div>
-      <div class="rate">${(st.ok || 0).toLocaleString()} ok${errs ? ' · ' + errs : ''}${st.retrying ? ' · ' + st.retrying + ' retrying' : ''}</div>
+      <div class="head"><span class="id">#${r.id || '?'}${r.leader ? ' ★' : ''}</span><span class="st st-${r.state === 'working' ? 'running' : (r.state || 'unknown')}">${esc(r.state || 'unknown')}</span></div>
+      <div class="big">${(r.tried || 0).toLocaleString()} <span class="unit">codes answered</span></div>
+      <div class="rows">
+        ${kv('Speed now', `${f1(r.rate)}/s`)}
+        ${kv('Speed limit', `${f1(st.pace)}/s`)}
+        ${kv('Waiting to try', (r.buffer_len || 0).toLocaleString())}
+        ${errs.length ? kv('Site pushback', errs.join(' · ')) : ''}
+        ${st.retrying ? kv('Being retried', st.retrying.toLocaleString()) : ''}
+      </div>
     </div>`;
   } catch (e) {
     return `<div class="rep"><span class="id">#${r && r.id || '?'}</span><span class="st">error</span></div>`;
   }
-}
-// ("12 × 429 · 3 × 5xx": a replica's errors, each retried until the site answers)
-function errText(st) {
-  return [[st.e429, '429'], [st.e5, '5xx'], [st.e4, '4xx'], [st.timeouts, 'timeouts'], [st.net, 'conn']]
-    .filter(([n]) => n).map(([n, k]) => `${n.toLocaleString()} ${k}`).join(' · ');
 }
 
 async function refresh() {
