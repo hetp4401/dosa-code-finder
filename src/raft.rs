@@ -581,7 +581,10 @@ impl Node {
             r.next.insert(by, next);
         }
         let need_apply = r.commit > r.applied;
-        let need_rep = r.role == Role::Leader;
+        // An idle heartbeat acknowledgment ends the exchange. Retry a rejected
+        // append or continue sending missing entries immediately; caught-up
+        // peers wait for the normal heartbeat timer instead of ping-ponging.
+        let need_rep = !ok || r.next.get(&by).copied().unwrap_or(1) <= r.last_index();
         drop(r);
         if need_rep {
             self.replicate_to(by);
@@ -765,10 +768,11 @@ impl Node {
         }
         let snap = self.sm.lock().unwrap().snapshot(r.commit, r.term_at(r.commit));
         let idx = snap.last_index;
+        let term = snap.last_term;
         r.snap = Some(snap);
         r.log.clear();
         r.base_index = idx;
-        r.base_term = r.term_at(idx);
+        r.base_term = term;
         // Followers that missed it get the snapshot on next contact.
         for v in r.next.values_mut() {
             *v = (*v).max(idx + 1);
@@ -1016,5 +1020,125 @@ impl Node {
         } else {
             self.stop_work();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn leader() -> (Arc<Node>, mpsc::UnboundedReceiver<String>) {
+        let node = Node::new(1, 3, reqwest::Client::new(), Arc::new(crate::Pacer::new()));
+        node.raft.lock().unwrap().become_leader(1, 3);
+        let (tx, rx) = mpsc::unbounded_channel();
+        node.register(2, "test-peer".into(), tx);
+        (node, rx)
+    }
+
+    fn entry(index: u64) -> Entry {
+        Entry { term: 1, index, cmd: Command::End { id: "test-scan".into(), at: 0 } }
+    }
+
+    #[tokio::test]
+    async fn caught_up_ack_does_not_send_another_heartbeat() {
+        let (node, mut rx) = leader();
+        node.replicate_to(2);
+        let message: Msg = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(message, Msg::AppendEntries { entries, .. } if entries.is_empty()));
+        node.on_ae_reply(1, true, 0, 2);
+        assert!(rx.try_recv().is_err(), "idle acknowledgment must not trigger another message");
+    }
+
+    #[tokio::test]
+    async fn lagging_peer_continues_receiving_entries() {
+        let (node, mut rx) = leader();
+        node.raft.lock().unwrap().log = vec![entry(1), entry(2)];
+        node.on_ae_reply(1, true, 0, 2);
+        let message: Msg = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(message, Msg::AppendEntries { pli: 0, entries, .. } if entries.len() == 2));
+        node.on_ae_reply(1, true, 2, 2);
+        while let Ok(message) = rx.try_recv() {
+            assert!(!matches!(serde_json::from_str::<Msg>(&message).unwrap(), Msg::AppendEntries { .. }));
+        }
+        assert_eq!(node.raft.lock().unwrap().commit, 2);
+    }
+
+    #[tokio::test]
+    async fn rejection_retries_from_the_previous_log_index() {
+        let (node, mut rx) = leader();
+        {
+            let mut raft = node.raft.lock().unwrap();
+            raft.log = vec![entry(1), entry(2)];
+            raft.next.insert(2, 3);
+        }
+        node.on_ae_reply(1, false, 0, 2);
+        let message: Msg = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(message, Msg::AppendEntries { pli: 1, entries, .. } if entries.len() == 1 && entries[0].index == 2));
+    }
+
+    #[tokio::test]
+    async fn compacted_log_rejection_still_sends_a_snapshot() {
+        let (node, mut rx) = leader();
+        {
+            let mut raft = node.raft.lock().unwrap();
+            raft.base_index = 10;
+            raft.base_term = 1;
+            raft.commit = 10;
+            raft.applied = 10;
+            raft.snap = Some(node.sm.lock().unwrap().snapshot(10, 1));
+            raft.next.insert(2, 11);
+        }
+        node.on_ae_reply(1, false, 0, 2);
+        let message: Msg = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(matches!(message, Msg::InstallSnapshot { snap, .. } if snap.last_index == 10));
+    }
+
+    #[tokio::test]
+    async fn compacted_snapshot_accepts_the_next_heartbeat() {
+        let (node, mut outbound) = leader();
+        {
+            let mut raft = node.raft.lock().unwrap();
+            raft.term = 7;
+            raft.log = vec![Entry { term: 7, ..entry(1) }, Entry { term: 7, ..entry(2) }];
+            raft.commit = 2;
+            raft.applied = 2;
+        }
+        node.maybe_snapshot();
+        let snapshot = node.raft.lock().unwrap().snap.clone().unwrap();
+        assert_eq!(node.raft.lock().unwrap().base_term, snapshot.last_term);
+        let follower = Node::new(2, 3, reqwest::Client::new(), Arc::new(crate::Pacer::new()));
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        follower.register(1, "test-leader".into(), tx);
+        follower.on_snapshot(7, 1, snapshot);
+        while replies.try_recv().is_ok() {}
+        node.replicate_to(2);
+        let message: Msg = serde_json::from_str(&outbound.try_recv().unwrap()).unwrap();
+        if let Msg::AppendEntries { term, leader, pli, plt, entries, lc } = message {
+            follower.on_append(1, term, leader, pli, plt, entries, lc);
+        } else { panic!("expected an idle heartbeat after snapshot installation"); }
+        let reply: Msg = serde_json::from_str(&replies.try_recv().unwrap()).unwrap();
+        assert!(matches!(reply, Msg::AppendEntriesReply { ok: true, idx: 2, .. }));
+        node.on_ae_reply(7, true, 2, 2);
+        assert!(outbound.try_recv().is_err(), "snapshot catch-up must finish without an idle resend loop");
+    }
+
+    #[tokio::test]
+    async fn idle_peer_traffic_is_bounded_by_the_heartbeat_timer() {
+        let (node, mut rx) = leader();
+        node.raft.lock().unwrap().hb_at = Instant::now() - HEARTBEAT;
+        let tick = tokio::spawn(node.clone().raft_tick());
+        let end = tokio::time::Instant::now() + Duration::from_millis(950);
+        let mut heartbeats = 0;
+        while let Ok(Some(message)) = tokio::time::timeout_at(end, rx.recv()).await {
+            let message: Msg = serde_json::from_str(&message).unwrap();
+            if matches!(message, Msg::AppendEntries { .. }) {
+                heartbeats += 1;
+                assert!(heartbeats <= 4, "heartbeat acknowledgments are generating an unbounded loop");
+                node.on_ae_reply(1, true, 0, 2);
+            }
+        }
+        tick.abort();
+        assert!(heartbeats >= 2, "periodic heartbeats must continue while idle");
     }
 }

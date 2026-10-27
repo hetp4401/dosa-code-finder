@@ -43,7 +43,7 @@ jobs:
           ADMIN_PW: ${{ secrets.FLEET_ADMIN_PASSWORD }}
         run: |
           # The fleet app is password-locked: send x-admin-password on both calls.
-          replicas=$(curl -fsS -H "x-admin-password: $ADMIN_PW" "$URL" | jq -e '.replicas') || replicas=1
+          replicas=$(curl -fsS -H "x-admin-password: $ADMIN_PW" "$URL" | jq -e '.replicas')
           sed "s/__TAG__/$GITHUB_SHA/" compose.yaml | jq -Rs --argjson r "$replicas" '{compose: ., port: 3000, replicas: $r}' \
             | curl -fsS -X PUT "$URL" -H 'Content-Type: application/json' -H "x-admin-password: $ADMIN_PW" --data-binary @- \
             | jq -e '{name, version, replicas, unchanged}'
